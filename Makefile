@@ -36,6 +36,10 @@ host-test:
 	./$(BUILD)/test_vpad_abi
 	$(HOST_CC) $(HOST_CFLAGS) $(HOST_SANITIZERS) -Isrc src/usb_controllers.c src/profiles.c src/util.c src/log.c tests/test_flow_sim.c -o $(BUILD)/test_flow_sim
 	./$(BUILD)/test_flow_sim
+	$(HOST_CC) $(HOST_CFLAGS) $(HOST_SANITIZERS) -Isrc src/usb_desc.c tests/test_usb_desc.c -o $(BUILD)/test_usb_desc
+	./$(BUILD)/test_usb_desc
+	$(HOST_CC) $(HOST_CFLAGS) $(HOST_SANITIZERS) -Isrc src/gip.c src/usb_controllers.c src/profiles.c src/util.c src/log.c tests/test_gamesir_gip.c -o $(BUILD)/test_gamesir_gip
+	./$(BUILD)/test_gamesir_gip
 	$(HOST_CC) $(HOST_CFLAGS) $(HOST_SANITIZERS) -Isrc src/bt_packets.c tests/test_bt_packets.c -o $(BUILD)/test_bt_packets
 	./$(BUILD)/test_bt_packets
 	$(HOST_CC) $(HOST_CFLAGS) $(HOST_SANITIZERS) -Isrc src/tcp_frames.c tests/test_tcp_frames.c -o $(BUILD)/test_tcp_frames

@@ -1,5 +1,7 @@
 #include "usb_hotplug.h"
 #include "usb_controllers.h"
+#include "usb_desc.h"
+#include "gip.h"
 #include "ps5_vpad.h"
 #include "log.h"
 #include "usb_lifecycle.h"
@@ -35,6 +37,9 @@ typedef struct {
     usb_lifecycle_t       lifecycle;
     int                   stop_thread;
     int                   use_fs;
+    usb_input_route_t     route;     /* interface/endpoints/protocol chosen from descriptors */
+    gip_ctx_t             gip;
+    int                   gip_reinit_pending; /* a GIP announce asked for the init sequence */
 
 #ifdef __PROSPERO__
     struct usb_fs_endpoint endpoints[4];
@@ -45,6 +50,9 @@ typedef struct {
     uint32_t              fs_len[4];
     uint8_t               rx_buf[64];
     uint8_t               tx_buf[64];
+    uint32_t              in_xfer_len;  /* IN transfer size, wMaxPacketSize of the endpoint */
+    int                   in_pending, in_ready, in_stalled;
+    int                   out_pending, out_ready, out_stalled;
 #else
     int                   ep_fd[6];
 #endif
@@ -113,6 +121,20 @@ static void request_worker_stop(usb_slot_device_t *dev)
     pthread_mutex_unlock(&g_usb_hotplug.lock);
 }
 
+/* Writes len bytes as hex, 32 per log line (log_line truncates at 1 KiB). */
+static void log_hex_block(const char *what, int slot, const uint8_t *data, int len)
+{
+    char line[3 * 32 + 1];
+    for (int off = 0; off < len; off += 32) {
+        int n = (len - off) < 32 ? (len - off) : 32;
+        for (int i = 0; i < n; i++) {
+            snprintf(line + i * 3, sizeof(line) - (size_t)i * 3, "%02x ", data[off + i]);
+        }
+        line[n * 3 - 1] = '\0';
+        log_line("usb_hotplug: slot %d %s [%03d] %s", slot, what, off, line);
+    }
+}
+
 #ifdef __PROSPERO__
 
 static void find_usb_endpoints(int fd, usb_controller_type_t type, uint16_t vid, uint16_t pid, uint8_t *in_addr, uint8_t *out_addr)
@@ -176,9 +198,24 @@ static void find_usb_endpoints(int fd, usb_controller_type_t type, uint16_t vid,
     if (*out_addr == 0 && out_cnt > 0) *out_addr = outs[0];
 }
 
+static int read_config_descriptor(int fd, uint8_t *raw, size_t cap)
+{
+    struct usb_gen_descriptor desc;
+    memset(&desc, 0, sizeof(desc));
+    memset(raw, 0, cap);
+    desc.ugd_data = raw;
+    desc.ugd_maxlen = (uint16_t)cap;
+    if (ioctl(fd, USB_GET_FULL_DESC, &desc) != 0) return -1;
+    int len = desc.ugd_actlen;
+    if (len <= 0 || len > (int)cap) len = (int)cap;
+    return len;
+}
+
 static int usb_fs_setup_device(usb_slot_device_t *sdev)
 {
-    int iface = 0;
+    /* A protocol-only fallback route (descriptor unreadable) has no endpoints */
+    int route_known = (sdev->route.kind != USB_ROUTE_NONE && sdev->route.ep_in != 0);
+    int iface = route_known ? sdev->route.iface : 0;
     ioctl(sdev->fd, USB_CLAIM_INTERFACE, &iface);
 
     int config = 0;
@@ -188,14 +225,32 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
     }
 
     uint8_t in_addr = 0, out_addr = 0;
-    find_usb_endpoints(sdev->fd, sdev->type, sdev->vid, sdev->pid, &in_addr, &out_addr);
+    if (route_known) {
+        /* Endpoints of the interface that actually carries gamepad input */
+        in_addr = sdev->route.ep_in;
+        out_addr = sdev->route.ep_out;
+    } else {
+        find_usb_endpoints(sdev->fd, sdev->type, sdev->vid, sdev->pid, &in_addr, &out_addr);
+    }
 
     int is_xbox_one = (sdev->type == CTRL_XBOX_XINPUT && sdev->vid == 0x045e && sdev->pid != 0x028e);
     if (in_addr == 0) {
         in_addr = is_xbox_one ? 0x82 : 0x81;
     }
-    if (out_addr == 0 && (sdev->type == CTRL_XBOX_XINPUT)) {
+    if (out_addr == 0 && !route_known && (sdev->type == CTRL_XBOX_XINPUT)) {
         out_addr = is_xbox_one ? 0x02 : 0x01;
+    }
+
+    /* xpad and xone select alt 0 of the GIP audio interface ("mandatory for certain
+     * third party devices"). It must precede USB_FS_INIT: it tears down FS state. */
+    if (sdev->route.kind == USB_ROUTE_GIP && sdev->route.iface_count > 1) {
+        struct usb_alt_interface alt;
+        memset(&alt, 0, sizeof(alt));
+        alt.uai_interface_index = 1;
+        alt.uai_alt_index = 0;
+        int r = ioctl(sdev->fd, USB_SET_ALTINTERFACE, &alt);
+        log_line("usb_hotplug: %s GIP audio interface alt 0 -> %s",
+                 sdev->name, r == 0 ? "ok" : strerror(errno));
     }
 
     struct usb_fs_init init;
@@ -218,14 +273,24 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
     uint8_t try_ins[] = { in_addr, 0x81, 0x82, 0x83, 0x84 };
     for (size_t i = 0; i < sizeof(try_ins); i++) {
         if (try_ins[i] == 0) continue;
+        /* One transfer per packet: a 64-byte buffer on a 32-byte endpoint would merge
+         * two full-size reports into one read */
+        uint32_t want = sizeof(sdev->rx_buf);
+        if (i == 0 && route_known && sdev->route.in_maxpkt >= 8 &&
+            sdev->route.in_maxpkt <= sizeof(sdev->rx_buf)) {
+            want = sdev->route.in_maxpkt;
+        }
         memset(&open_in, 0, sizeof(open_in));
-        open_in.max_bufsize = 64;
+        open_in.max_bufsize = want;
         open_in.max_frames = 1;
         open_in.ep_index = sdev->in_index;
         open_in.ep_no = try_ins[i];
         if (ioctl(sdev->fd, USB_FS_OPEN, &open_in) == 0) {
             in_addr = try_ins[i];
             in_opened = 1;
+            /* The kernel writes back the size it actually allocated */
+            sdev->in_xfer_len = (open_in.max_bufsize > 0 && open_in.max_bufsize <= sizeof(sdev->rx_buf))
+                                ? open_in.max_bufsize : want;
             break;
         }
     }
@@ -234,9 +299,17 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
         return 0;
     }
 
+    if (route_known && in_addr != sdev->route.ep_in) {
+        log_line("usb_hotplug: %s route IN 0x%02x unavailable, fell back to 0x%02x",
+                 sdev->name, sdev->route.ep_in, in_addr);
+    }
+
     sdev->has_out = 0;
     uint8_t try_outs[] = { out_addr, 0x02, 0x01, 0x03, 0x04 };
-    for (size_t i = 0; i < sizeof(try_outs); i++) {
+    /* With a known route only the gamepad interface's own OUT endpoint is valid:
+     * another interface's OUT (audio, keyboard) would swallow init commands. */
+    size_t n_outs = route_known ? 1 : sizeof(try_outs);
+    for (size_t i = 0; i < n_outs; i++) {
         if (try_outs[i] == 0) continue;
         sdev->out_index = 1;
         struct usb_fs_open open_out;
@@ -252,6 +325,9 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
         }
     }
 
+    sdev->in_pending = sdev->in_ready = sdev->in_stalled = 0;
+    sdev->out_pending = sdev->out_ready = sdev->out_stalled = 0;
+
     sdev->fs_frame[0] = sdev->rx_buf;
     sdev->fs_len[0] = sizeof(sdev->rx_buf);
     sdev->endpoints[0].ppBuffer = &sdev->fs_frame[0];
@@ -266,39 +342,72 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
     sdev->endpoints[1].nFrames = 1;
     sdev->endpoints[1].flags = USB_FS_FLAG_SINGLE_SHORT_OK;
 
-    log_line("usb_hotplug: %s claimed via USB_FS (IN=0x%02x, OUT=0x%02x)",
-             sdev->name, in_addr, out_addr);
+    log_line("usb_hotplug: %s claimed via USB_FS (route=%s iface=%u IN=0x%02x/%u, OUT=0x%02x%s)",
+             sdev->name, usb_route_name(sdev->route.kind), (unsigned)sdev->route.iface,
+             in_addr, (unsigned)sdev->in_xfer_len, out_addr, sdev->has_out ? "" : " unavailable");
     return 1;
+}
+
+/* Reaps one finished transfer. USB_FS_COMPLETE drains a single queue shared by
+ * every endpoint of the fd and reports which one finished, so an OUT completion
+ * must never be read as input (stale rx_buf) nor an IN completion be lost by a send.
+ * Returns the endpoint index or -1 (errno set, EBUSY when nothing finished). */
+static int usb_fs_reap(usb_slot_device_t *dev)
+{
+    struct usb_fs_complete complete;
+    memset(&complete, 0, sizeof(complete));
+    if (ioctl(dev->fd, USB_FS_COMPLETE, &complete) != 0) return -1;
+    if (complete.ep_index == dev->in_index) {
+        dev->in_pending = 0;
+        dev->in_ready = 1;     /* data (if any) is parked in rx_buf until recv takes it */
+    } else if (complete.ep_index == dev->out_index) {
+        dev->out_pending = 0;
+        dev->out_ready = 1;
+    }
+    return complete.ep_index;
+}
+
+static int usb_fs_take_input(usb_slot_device_t *dev, uint8_t *buffer, uint32_t length)
+{
+    struct usb_fs_endpoint *ep = &dev->endpoints[dev->in_index];
+    dev->in_ready = 0;
+    if (ep->status == USB_ERR_NORMAL_COMPLETION || ep->status == USB_ERR_SHORT_XFER) {
+        uint32_t n = dev->fs_len[dev->in_index];
+        if (n > length) n = length;
+        if (n > sizeof(dev->rx_buf)) n = sizeof(dev->rx_buf);
+        memcpy(buffer, dev->rx_buf, n);
+        return (int)n;
+    }
+    if (ep->status == USB_ERR_STALLED) dev->in_stalled = 1; /* cleared on the next start */
+    return 0;
 }
 
 static int usb_fs_recv_packet(usb_slot_device_t *dev, uint8_t *buffer, uint32_t length, int timeout_ms)
 {
     if (!dev->use_fs) return -1;
-    struct usb_fs_endpoint *ep = &dev->endpoints[dev->in_index];
-    uint32_t ask_len = length > 64 ? 64 : length;
-    dev->fs_len[dev->in_index] = ask_len;
-    ep->timeout = (uint16_t)timeout_ms;
+    if (dev->in_ready) return usb_fs_take_input(dev, buffer, length);
 
-    struct usb_fs_start start;
-    memset(&start, 0, sizeof(start));
-    start.ep_index = dev->in_index;
-    if (ioctl(dev->fd, USB_FS_START, &start) != 0) {
-        if (errno != EBUSY) return -1;
+    if (!dev->in_pending) {
+        struct usb_fs_endpoint *ep = &dev->endpoints[dev->in_index];
+        uint32_t ask_len = dev->in_xfer_len ? dev->in_xfer_len : sizeof(dev->rx_buf);
+        if (ask_len > length) ask_len = length;
+        dev->fs_len[dev->in_index] = ask_len;
+        ep->timeout = (uint16_t)timeout_ms;
+        ep->flags = USB_FS_FLAG_SINGLE_SHORT_OK | (dev->in_stalled ? USB_FS_FLAG_CLEAR_STALL : 0);
+
+        struct usb_fs_start start;
+        memset(&start, 0, sizeof(start));
+        start.ep_index = dev->in_index;
+        if (ioctl(dev->fd, USB_FS_START, &start) != 0 && errno != EBUSY) return -1;
+        dev->in_pending = 1;
+        dev->in_stalled = 0;
     }
 
     int spins = timeout_ms / 4 + 1;
     while (spins-- > 0) {
-        struct usb_fs_complete complete;
-        memset(&complete, 0, sizeof(complete));
-        complete.ep_index = dev->in_index;
-        if (ioctl(dev->fd, USB_FS_COMPLETE, &complete) == 0) {
-            if (ep->status == USB_ERR_NORMAL_COMPLETION || ep->status == USB_ERR_SHORT_XFER) {
-                uint32_t n = dev->fs_len[dev->in_index];
-                if (n > length) n = length;
-                memcpy(buffer, dev->rx_buf, n);
-                return (int)n;
-            }
-            return 0;
+        if (usb_fs_reap(dev) >= 0) {
+            if (dev->in_ready) return usb_fs_take_input(dev, buffer, length);
+            continue; /* an OUT transfer finished: keep waiting for input */
         }
         if (errno == EBUSY || errno == ETIMEDOUT || errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Transfer still in progress or waiting for packet — continue select loop */
@@ -307,14 +416,12 @@ static int usb_fs_recv_packet(usb_slot_device_t *dev, uint8_t *buffer, uint32_t 
         }
 
         struct timeval wait;
-        fd_set rset, wset;
+        fd_set rset;
         FD_ZERO(&rset);
-        FD_ZERO(&wset);
         FD_SET(dev->fd, &rset);
-        FD_SET(dev->fd, &wset);
         wait.tv_sec = 0;
         wait.tv_usec = 4000;
-        select(dev->fd + 1, &rset, &wset, NULL, &wait);
+        select(dev->fd + 1, &rset, NULL, NULL, &wait);
     }
     return 0;
 }
@@ -322,25 +429,38 @@ static int usb_fs_recv_packet(usb_slot_device_t *dev, uint8_t *buffer, uint32_t 
 static int usb_fs_send_packet(usb_slot_device_t *dev, const uint8_t *buffer, uint32_t length, int timeout_ms)
 {
     if (!dev->use_fs || !dev->has_out) return -1;
+    int spins = timeout_ms / 4 + 1;
+
+    /* An earlier OUT that outlived its caller's wait may still be in flight */
+    while (dev->out_pending && spins-- > 0) {
+        if (usb_fs_reap(dev) < 0) {
+            if (errno != EBUSY) return -1;
+            usleep(4000);
+        }
+    }
+    if (dev->out_pending) return -1;
+
     struct usb_fs_endpoint *ep = &dev->endpoints[dev->out_index];
-    uint32_t send_len = length > 64 ? 64 : length;
+    uint32_t send_len = length > sizeof(dev->tx_buf) ? sizeof(dev->tx_buf) : length;
     memcpy(dev->tx_buf, buffer, send_len);
     dev->fs_len[dev->out_index] = send_len;
     ep->timeout = (uint16_t)timeout_ms;
+    ep->flags = USB_FS_FLAG_SINGLE_SHORT_OK | (dev->out_stalled ? USB_FS_FLAG_CLEAR_STALL : 0);
 
     struct usb_fs_start start;
     memset(&start, 0, sizeof(start));
     start.ep_index = dev->out_index;
-    if (ioctl(dev->fd, USB_FS_START, &start) != 0) {
-        if (errno != EBUSY) return -1;
-    }
+    if (ioctl(dev->fd, USB_FS_START, &start) != 0) return -1;
+    dev->out_pending = 1;
+    dev->out_ready = 0;
+    dev->out_stalled = 0;
 
-    int spins = timeout_ms / 5 + 1;
+    spins = timeout_ms / 4 + 1;
     while (spins-- > 0) {
-        struct usb_fs_complete complete;
-        memset(&complete, 0, sizeof(complete));
-        complete.ep_index = dev->out_index;
-        if (ioctl(dev->fd, USB_FS_COMPLETE, &complete) == 0) {
+        if (usb_fs_reap(dev) >= 0) {
+            if (!dev->out_ready) continue; /* input arrived meanwhile: parked for recv */
+            dev->out_ready = 0;
+            if (ep->status == USB_ERR_STALLED) dev->out_stalled = 1;
             return (ep->status == USB_ERR_NORMAL_COMPLETION || ep->status == USB_ERR_SHORT_XFER) ? (int)send_len : -1;
         }
         if (errno != EBUSY) return -1;
@@ -349,64 +469,150 @@ static int usb_fs_send_packet(usb_slot_device_t *dev, const uint8_t *buffer, uin
     return -1;
 }
 
-static void ack_gip_packet(usb_slot_device_t *dev, const uint8_t *report, int count)
+static void gip_send_init_sequence(usb_slot_device_t *dev)
 {
-    if (!dev->has_out || !report || count < 4) return;
-    size_t offset = 0;
-    while (offset + 4 <= (size_t)count) {
-        const uint8_t *msg = report + offset;
-        size_t payload = msg[3];
-        if ((msg[3] & 0x80) || payload < 2 || payload > 60 || offset + 4 + payload > (size_t)count) break;
-        offset += 4 + payload;
-        if ((msg[1] & 0x10) == 0) continue;
-        uint8_t client = (uint8_t)((msg[1] & 0x0f) | 0x20);
-        uint8_t ack[13];
-        memset(ack, 0, sizeof(ack));
-        ack[0] = 0x01;
-        ack[1] = client;
-        ack[2] = msg[2];
-        ack[3] = 0x09;
-        ack[5] = msg[0];
-        ack[6] = client;
-        ack[7] = (uint8_t)payload;
-        usb_fs_send_packet(dev, ack, sizeof(ack), 40);
+    uint8_t pkt[GIP_MAX_PACKET];
+    size_t len;
+    int sent = 0, failed = 0;
+
+    gip_restart_init(&dev->gip);
+    while ((len = gip_next_init_packet(&dev->gip, pkt, sizeof(pkt))) > 0) {
+        if (usb_fs_send_packet(dev, pkt, (uint32_t)len, 80) < 0) failed++;
+        else sent++;
+        usleep(5000);
     }
+    log_line("usb_hotplug: slot %d GIP init sequence sent (%d ok, %d failed)", dev->slot, sent, failed);
+}
+
+
+/* Asks a GameSir HID-mode pad for its full report format (A1 C8 ...), as SDL does.
+ * Simple 9-byte reports are still decoded if the pad ignores the request. */
+static void gamesir_send_mode_switch(usb_slot_device_t *dev)
+{
+    uint8_t cmd[64];
+    size_t len = usb_gamesir_build_mode_switch(cmd, sizeof(cmd));
+    int r = -1;
+    const char *how = "interrupt OUT";
+
+    if (len == 0) return;
+    if (dev->has_out) {
+        r = usb_fs_send_packet(dev, cmd, (uint32_t)len, 80);
+    }
+    if (r < 0) {
+        /* HID SET_REPORT(Output, report id 0xA2) on the default control pipe */
+        struct usb_ctl_request req;
+        memset(&req, 0, sizeof(req));
+        req.ucr_request.bmRequestType = 0x21;
+        req.ucr_request.bRequest = 0x09;
+        USETW(req.ucr_request.wValue, 0x0200 | cmd[0]);
+        USETW(req.ucr_request.wIndex, dev->route.iface);
+        USETW(req.ucr_request.wLength, (uint16_t)len);
+        req.ucr_data = cmd;
+        r = (ioctl(dev->fd, USB_DO_REQUEST, &req) == 0) ? (int)len : -1;
+        how = "SET_REPORT";
+    }
+    log_line("usb_hotplug: slot %d GameSir mode switch via %s -> %s",
+             dev->slot, how, r < 0 ? "failed (simple reports will be used)" : "ok");
 }
 
 #endif /* __PROSPERO__ */
+
+/* Sends the ACK a GIP message asked for; unacknowledged reliable messages make
+ * the pad fall back to the Arrival state (Xbox One S guide packets repeat forever). */
+static void gip_ack_cb(void *user, const uint8_t *ack, size_t len)
+{
+#ifdef __PROSPERO__
+    usb_slot_device_t *dev = (usb_slot_device_t *)user;
+    if (dev->use_fs && dev->has_out) usb_fs_send_packet(dev, ack, (uint32_t)len, 40);
+#else
+    (void)user; (void)ack; (void)len;
+#endif
+}
+
+typedef enum {
+    PKT_STATE = 0,   /* decoded a full pad state */
+    PKT_IGNORED,     /* valid protocol traffic without input meaning */
+    PKT_UNPARSED     /* unknown bytes */
+} pkt_kind_t;
+
+/* Decodes one transfer with the protocol of the claimed interface. Routed
+ * protocols never fall back to the generic HID guesser: a status, heartbeat or
+ * vendor packet misread as a gamepad report is exactly what turned stick motion
+ * into phantom button presses. */
+static pkt_kind_t decode_packet(usb_slot_device_t *dev, const uint8_t *report, int n, pad_state_t *st)
+{
+    switch (dev->route.kind) {
+    case USB_ROUTE_GIP: {
+        int ev = gip_process(&dev->gip, report, (size_t)n, st, gip_ack_cb, dev);
+        /* Hello: the pad waits in the Arrival state for Set Device State START */
+        if (ev & GIP_EVENT_ANNOUNCE) dev->gip_reinit_pending = 1;
+        if (ev & GIP_EVENT_STATE) return PKT_STATE;
+        return ev ? PKT_IGNORED : PKT_UNPARSED;
+    }
+    case USB_ROUTE_X360:
+        return usb_parse_x360_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
+    default:
+        break;
+    }
+
+    if (dev->type == CTRL_GAMESIR) {
+        return usb_parse_gamesir_hid_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
+    }
+
+    /* Legacy VID/PID heuristics (Machenike HID mode, DS4, Switch Pro, DS3, generic HID) */
+    if (usb_parse_input_report(dev->type, report, (size_t)n, st)) return PKT_STATE;
+    if (usb_parse_input_report(CTRL_GENERIC_HID, report, (size_t)n, st)) return PKT_STATE;
+    return PKT_UNPARSED;
+}
 
 static void *usb_reader_worker(void *arg)
 {
     usb_slot_device_t *dev = (usb_slot_device_t *)arg;
     uint8_t report[256];
     pad_state_t st;
-    
+    pad_state_t last_state;
+    int have_state = 0;
+    long last_push_time = 0;
+
     long last_data_time = now_ms();
 #ifdef __PROSPERO__
     long last_led_time = 0;
+    long last_init_time = 0;
+    int init_attempts = 0;
+    unsigned long n_announces = 0;
 #endif
+    int gip_len_logged = 0;
     long last_log_t = 0;
+    long last_unparsed_log_t = 0;
+    long last_idle_log_t = 0;
     int consecutive_errors = 0;
+    int raw_logged = 0;
+    unsigned long n_unparsed = 0;
 
-    log_line("usb_hotplug: Reader thread started for slot %d (%s on %s)",
-             dev->slot, dev->name, dev->dev_path);
+    /* GIP, XInput and GameSir pads only send a report when something changes */
+    int event_driven = (dev->route.kind == USB_ROUTE_GIP ||
+                        dev->route.kind == USB_ROUTE_X360 ||
+                        dev->type == CTRL_GAMESIR);
+
+    pad_state_neutral(&last_state);
+    log_line("usb_hotplug: Reader thread started for slot %d (%s on %s, route=%s)",
+             dev->slot, dev->name, dev->dev_path, usb_route_name(dev->route.kind));
 
 #ifdef __PROSPERO__
-    int is_xbox_one = (dev->type == CTRL_XBOX_XINPUT && dev->vid == 0x045e && dev->pid != 0x028e);
     int is_genuine_x360 = (dev->type == CTRL_XBOX_XINPUT && dev->vid == 0x045e && dev->pid == 0x028e);
-    if (dev->use_fs && dev->has_out && is_xbox_one) {
-        static const uint8_t power_on[] = {0x05, 0x20, 0x00, 0x01, 0x00};
-        static const uint8_t s_init[] = {
-            0x05, 0x20, 0x00, 0x0f, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x55, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        };
-        static const uint8_t led_on[] = {0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14};
-        usb_fs_send_packet(dev, power_on, sizeof(power_on), 80);
-        usleep(10000);
-        usb_fs_send_packet(dev, s_init, sizeof(s_init), 80);
-        usleep(10000);
-        usb_fs_send_packet(dev, led_on, sizeof(led_on), 80);
-        log_line("usb_hotplug: GIP power/s_init/led sent on slot %d", dev->slot);
+    if (dev->use_fs && dev->route.kind == USB_ROUTE_GIP) {
+        if (dev->has_out) {
+            gip_send_init_sequence(dev);
+            init_attempts = 1;
+            last_init_time = now_ms();
+        } else {
+            log_line("usb_hotplug: slot %d GIP device has no usable OUT endpoint - it cannot be powered on", dev->slot);
+        }
+    } else if (dev->use_fs && dev->type == CTRL_GAMESIR && dev->route.kind != USB_ROUTE_X360 &&
+               (dev->pid == 0x10b8 || dev->pid == 0x103c)) {
+        /* Only the 8K firmwares implement SDL's mode switch; the regular G7 Pro HID
+         * identity (0x1022) streams its simple 9-byte report without it */
+        gamesir_send_mode_switch(dev);
     }
 #endif
 
@@ -420,15 +626,31 @@ static void *usb_reader_worker(void *arg)
             uint8_t x360_led[] = { 0x01, 0x03, 0x06 };
             usb_fs_send_packet(dev, x360_led, sizeof(x360_led), 40);
         }
+
+        if (dev->use_fs && dev->has_out && dev->route.kind == USB_ROUTE_GIP) {
+            if (dev->gip_reinit_pending && (cur_time - last_init_time >= 400)) {
+                /* Hello repeats every 500 ms until the pad is started */
+                dev->gip_reinit_pending = 0;
+                n_announces++;
+                if (n_announces <= 5 || (n_announces % 20) == 0) {
+                    log_line("usb_hotplug: slot %d GIP announce #%lu - sending init", dev->slot, n_announces);
+                }
+                last_init_time = cur_time;
+                gip_send_init_sequence(dev);
+            } else if (!dev->gip.started && init_attempts < 5 && (cur_time - last_init_time > 2000)) {
+                /* Neither input nor status yet: the first init may have been dropped while booting */
+                init_attempts++;
+                last_init_time = cur_time;
+                log_line("usb_hotplug: slot %d GIP pad silent - retrying init (%d/5)", dev->slot, init_attempts);
+                gip_send_init_sequence(dev);
+            }
+        }
 #endif
 
         int n = 0;
 #ifdef __PROSPERO__
         if (dev->use_fs) {
             n = usb_fs_recv_packet(dev, report, sizeof(report), 15);
-            if (n > 0 && is_xbox_one) {
-                ack_gip_packet(dev, report, n);
-            }
         }
 #else
         for (int i = 0; i < 6; i++) {
@@ -445,11 +667,19 @@ static void *usb_reader_worker(void *arg)
 
         if (n > 0) {
             consecutive_errors = 0;
-            int parsed = usb_parse_input_report(dev->type, report, (size_t)n, &st);
-            if (!parsed) {
-                parsed = usb_parse_input_report(CTRL_GENERIC_HID, report, (size_t)n, &st);
+            if (raw_logged < 12) {
+                /* First packets verbatim: enough to identify any new report format from the log */
+                raw_logged++;
+                log_hex_block("rx", dev->slot, report, n < 64 ? n : 64);
             }
-            if (parsed) {
+
+            pkt_kind_t kind = decode_packet(dev, report, n, &st);
+            if (!gip_len_logged && dev->gip.have_input) {
+                gip_len_logged = 1;
+                log_line("usb_hotplug: slot %d GIP input report payload is %u bytes",
+                         dev->slot, (unsigned)dev->gip.input_len);
+            }
+            if (kind == PKT_STATE) {
                 st.conn_type = dev->conn_type;
                 st.vid = dev->vid;
                 st.pid = dev->pid;
@@ -460,17 +690,27 @@ static void *usb_reader_worker(void *arg)
                     vpad_add(dev->slot, dev->conn_type, dev->name);
                 }
                 vpad_update(dev->slot, &st);
+                last_state = st;
+                have_state = 1;
+                last_push_time = cur_time;
                 last_data_time = cur_time;
 
                 if (st.buttons != 0 && (cur_time - last_log_t > 300)) {
                     last_log_t = cur_time;
-                    log_line("usb_hotplug: slot %d button press 0x%08x (LX=%d LY=%d)",
-                             dev->slot, (unsigned)st.buttons, st.lx, st.ly);
+                    log_line("usb_hotplug: slot %d button press 0x%08x (LX=%d LY=%d RX=%d RY=%d L2=%d R2=%d)",
+                             dev->slot, (unsigned)st.buttons, st.lx, st.ly, st.rx, st.ry, st.l2, st.r2);
                 }
-            } else if (cur_time - last_log_t > 2000) {
-                last_log_t = cur_time;
-                log_line("usb_hotplug: slot %d unparsed %d bytes: %02x %02x %02x %02x %02x %02x",
-                         dev->slot, n, report[0], report[1], report[2], report[3], report[4], report[5]);
+            } else if (kind == PKT_IGNORED) {
+                /* Heartbeats / status messages prove the link is alive */
+                last_data_time = cur_time;
+            } else {
+                n_unparsed++;
+                if (cur_time - last_unparsed_log_t > 2000) {
+                    last_unparsed_log_t = cur_time;
+                    log_line("usb_hotplug: slot %d ignored %d-byte packet (%lu so far)",
+                             dev->slot, n, n_unparsed);
+                    log_hex_block("unparsed", dev->slot, report, n < 32 ? n : 32);
+                }
             }
         } else if (n < 0) {
             consecutive_errors++;
@@ -480,17 +720,28 @@ static void *usb_reader_worker(void *arg)
                 request_worker_stop(dev);
                 break;
             }
-        } else if (cur_time - last_data_time > 3000 && cur_time - last_log_t > 3000) {
-            last_log_t = cur_time;
-            log_line("usb_hotplug: slot %d idle/standby (n=%d, use_fs=%d)",
-                     dev->slot, n, dev->use_fs);
+        } else if (cur_time - last_data_time > 3000) {
+            if (cur_time - last_idle_log_t > 30000) {
+                last_idle_log_t = cur_time;
+                log_line("usb_hotplug: slot %d idle/standby (n=%d, use_fs=%d)",
+                         dev->slot, n, dev->use_fs);
+            }
             /* If 2.4G dongle receives no packets for > 60 seconds (1 minute), release vpad to free user profile */
             if (dev->conn_type == CONN_USB_DONGLE_24G && (cur_time - last_data_time > 60000)) {
                 if (!vpad_slot_is_free(dev->slot)) {
                     log_line("usb_hotplug: slot %d 2.4G dongle idle for 60s — releasing virtual pad to standby", dev->slot);
                     vpad_remove(dev->slot);
+                    have_state = 0;
                 }
             }
+        }
+
+        /* Re-submit the last state of report-on-change pads; otherwise vpad_poll's 500 ms
+         * stale-state reset would release a stick or button that is simply being held. */
+        if (event_driven && have_state && (cur_time - last_push_time >= 100) &&
+            !vpad_slot_is_free(dev->slot)) {
+            vpad_update(dev->slot, &last_state);
+            last_push_time = cur_time;
         }
 
         usleep(4000); /* ~250 Hz polling tick */
@@ -576,40 +827,44 @@ static int find_free_slot(void)
     return -1;
 }
 
-static usb_controller_type_t usb_inspect_descriptors(int fd, const char **name_out)
+/* Reads the active configuration descriptor and picks the gamepad interface.
+ * Host builds have no descriptor access: the route stays NONE (legacy behavior). */
+static usb_input_route_t usb_compute_route(int fd, uint16_t vid, uint16_t pid,
+                                           uint8_t *raw, int cap, int *raw_len)
 {
+    usb_input_route_t route;
+    memset(&route, 0, sizeof(route));
+    *raw_len = 0;
 #ifdef __PROSPERO__
-    struct usb_gen_descriptor desc;
-    uint8_t raw[512];
-    memset(&desc, 0, sizeof(desc));
-    memset(raw, 0, sizeof(raw));
-    desc.ugd_data = raw;
-    desc.ugd_maxlen = sizeof(raw);
-    if (ioctl(fd, USB_GET_FULL_DESC, &desc) != 0) return CTRL_UNKNOWN;
-    int len = desc.ugd_actlen;
-    if (len <= 0 || len > (int)sizeof(raw)) len = (int)sizeof(raw);
-
-    int offset = 0;
-    while (offset + 2 <= len) {
-        int entry = raw[offset];
-        if (entry < 2 || offset + entry > len) break;
-        uint8_t bDescriptorType = raw[offset + 1];
-        if (bDescriptorType == 0x04 && entry >= 9) { /* Interface descriptor */
-            uint8_t if_class = raw[offset + 5];
-            uint8_t if_subclass = raw[offset + 6];
-
-            /* Xbox 360 / XInput interface (Class 0xFF, SubClass 0x5D) */
-            if (if_class == 0xFF && if_subclass == 0x5D) {
-                if (name_out) *name_out = "XInput Compatible Controller";
-                return CTRL_XBOX_XINPUT;
-            }
+    int len = read_config_descriptor(fd, raw, (size_t)cap);
+    if (len > 0) {
+        /* ugd_actlen may be unset: trust wTotalLength when it is plausible */
+        int total = (len >= 4 && raw[1] == 0x02) ? (raw[2] | (raw[3] << 8)) : len;
+        if (total >= 9 && total < len) len = total;
+        *raw_len = len;
+        usb_config_info_t cfg;
+        if (usb_desc_parse_config(raw, (size_t)len, &cfg) > 0) {
+            usb_desc_select_input(&cfg, &route);
         }
-        offset += entry;
+    }
+    /* Microsoft wireless adapters speak a radio protocol, never wired GIP */
+    if (vid == 0x045e && (pid == 0x02e6 || pid == 0x02fe || pid == 0x02f9 || pid == 0x091e)) {
+        memset(&route, 0, sizeof(route));
+    } else if (route.kind == USB_ROUTE_NONE) {
+        /* Descriptor unreadable: protocol implied by well-known IDs; endpoints are
+         * then searched the legacy way (ep_in stays 0) */
+        if ((vid == 0x3537 && pid == 0x10a8) ||
+            (vid == 0x045e && (pid == 0x02d1 || pid == 0x02dd || pid == 0x02e3 || pid == 0x02ea ||
+                               pid == 0x0b00 || pid == 0x0b12))) {
+            route.kind = USB_ROUTE_GIP;
+        } else if (vid == 0x3537 && pid == 0x10a9) {
+            route.kind = USB_ROUTE_X360;
+        }
     }
 #else
-    (void)fd; (void)name_out;
+    (void)fd; (void)vid; (void)pid; (void)raw; (void)cap;
 #endif
-    return CTRL_UNKNOWN;
+    return route;
 }
 
 static void probe_usb_devices(void)
@@ -650,9 +905,19 @@ static void probe_usb_devices(void)
             const char *ctrl_name = NULL;
             usb_controller_type_t ctype = usb_identify_controller(vid, pid, &ctrl_name);
 
-            /* If not found by VID/PID, inspect raw USB descriptors for XInput or HID classes */
+            uint8_t cfg_raw[512];
+            int cfg_len = 0;
+            usb_input_route_t route = usb_compute_route(fd, vid, pid, cfg_raw, (int)sizeof(cfg_raw), &cfg_len);
+
+            /* If not found by VID/PID, accept any device exposing an Xbox GIP or XInput interface */
             if (ctype == CTRL_UNKNOWN) {
-                ctype = usb_inspect_descriptors(fd, &ctrl_name);
+                if (route.kind == USB_ROUTE_GIP) {
+                    ctype = CTRL_XBOX_XINPUT;
+                    ctrl_name = "Xbox One/Series Compatible (GIP)";
+                } else if (route.kind == USB_ROUTE_X360) {
+                    ctype = CTRL_XBOX_XINPUT;
+                    ctrl_name = "XInput Compatible Controller";
+                }
             }
 
             if (vid != 0 || pid != 0) {
@@ -677,10 +942,17 @@ static void probe_usb_devices(void)
                 return;
             }
 
-            log_line("usb_hotplug: Claiming %s on %s (slot %d)", ctrl_name, path, slot);
+            log_line("usb_hotplug: Claiming %s on %s (slot %d, VID 0x%04x PID 0x%04x, route=%s iface=%u IN=0x%02x OUT=0x%02x)",
+                     ctrl_name, path, slot, vid, pid, usb_route_name(route.kind),
+                     (unsigned)route.iface, route.ep_in, route.ep_out);
+            if (cfg_len > 0) log_hex_block("config", slot, cfg_raw, cfg_len);
 
-            /* Perform controller-specific wake-up / LED handshake */
-            usb_init_controller_handshake(fd, ctype);
+            /* Xbox 360-style wake-up / LED handshake only fits XInput and legacy interfaces;
+             * GIP pads and GameSir HID pads are initialised by the reader thread. */
+            if (route.kind != USB_ROUTE_GIP &&
+                !(ctype == CTRL_GAMESIR && route.kind != USB_ROUTE_X360)) {
+                usb_init_controller_handshake(fd, ctype == CTRL_GAMESIR ? CTRL_XBOX_XINPUT : ctype);
+            }
 
             usb_slot_device_t *sdev = &g_usb_hotplug.devices[slot];
             reset_device(sdev);
@@ -693,6 +965,8 @@ static void probe_usb_devices(void)
             sdev->type = ctype;
             sdev->name = ctrl_name;
             sdev->stop_thread = 0;
+            sdev->route = route;
+            gip_init_ctx(&sdev->gip, vid, pid);
 
             int is_dongle = (vid == 0x045e && pid == 0x0719) ||
                             (vid == 0x045e && (pid == 0x02e6 || pid == 0x02fe)) ||
