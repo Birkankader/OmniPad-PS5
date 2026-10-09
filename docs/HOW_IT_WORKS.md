@@ -72,7 +72,8 @@ The engine is organized into **6 core layers**:
 
 Different manufacturers arrange button bits, analog sticks, and triggers in incompatible binary formats:
 - **DualShock 4:** 64-byte USB report with digital buttons packed into 4-bit nibbles.
-- **Xbox (XInput & GIP):** 20-byte report for Xbox 360 / clones, and 18+ byte GIP reports (`0x20` / Guide `0x07`) for wired Xbox One / Series X|S.
+- **Xbox (XInput & GIP):** 20-byte report for Xbox 360 / clones, and 18+ byte GIP reports (`0x20` / Guide `0x07`) for wired Xbox One / Series X|S. The protocol is picked from the interface descriptors (`usb_desc.c`), so third-party GIP/XInput pads work regardless of vendor ID; non-input traffic (announce, status, ACK) is consumed instead of being guessed as a HID report.
+- **GameSir HID:** 9-byte simple report (`3537:1022`) and the `A1 C8` full report of the 8K models.
 - **Nintendo Switch Pro:** Compact 12-bit packed analog coordinates over 64-byte USB report after handshake.
 
 The `profiles.c` and `usb_controllers.c` modules decode and normalize these reports into a uniform canonical structure:

@@ -103,6 +103,7 @@ graph TD
 |---|---|:---:|---|
 | **Machenike G5 Pro / G5 Pro Max SE** | Bundled 2.4GHz USB Dongle or USB-C Cable | 🟢 **Verified on PS5 Hardware** | Fully tested & verified in real 3-player gameplay on FW 13.60. Plug & play at 250Hz. |
 | **Microsoft Xbox Series X\|S & Xbox One** | Physical USB-C / Micro-USB Cable **OR** 8BitDo USB Adapter | 🟡 **Experimental (Spec-Implemented)** | Decodes GIP `0x20` input & `0x07` Guide packets via wired USB. *(Needs community testing on console)*. |
+| **GameSir G7 Pro** | USB-C Cable or 2.4GHz USB Dongle | 🟡 **Experimental (Spec-Implemented)** | GIP, XInput and GameSir HID modes detected from USB descriptors. *(Needs testing on console)*. |
 | **Microsoft Xbox 360** | Wired USB Cable (`045e:028e`) | 🟡 **Experimental (Spec-Implemented)** | XInput wired report parser implemented. |
 | **Sony DualShock 4** | Physical Micro-USB Cable | 🟡 **Experimental (Spec-Implemented)** | 64-byte USB HID parser implemented. *(Direct BT in v1.1.0)*. |
 | **Sony DualShock 3 (PS3)** | Physical Mini-USB Cable | 🟡 **Experimental (Spec-Implemented)** | USB magic wake packet (`0x03f4`) implemented. *(No Bluetooth)*. |
