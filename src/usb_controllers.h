@@ -30,6 +30,16 @@ uint8_t axis16_to_u8(int16_t val, int invert_y);
 int usb_parse_x360_report(const uint8_t *data, size_t len, pad_state_t *st);
 int usb_parse_gamesir_hid_report(const uint8_t *data, size_t len, pad_state_t *st);
 
+/* Xbox 360 wireless receiver channel (interface FF/5D/81), framed like xpad's
+ * xpad360w_process_packet. LINK_LOST also sets *st to neutral. */
+typedef enum {
+    X360W_PKT_UNKNOWN = 0,
+    X360W_PKT_STATE,       /* pad data decoded into *st */
+    X360W_PKT_STATUS,      /* battery, trailer, announce, "pad connected" */
+    X360W_PKT_LINK_LOST    /* the pad switched off or left range */
+} x360w_pkt_t;
+x360w_pkt_t usb_parse_x360w_report(const uint8_t *data, size_t len, pad_state_t *st);
+
 /* Builds the GameSir HID "full report" mode-switch output report (A2 01 00, padded).
  * Returns the number of bytes written (64) or 0 when the buffer is too small. */
 size_t usb_gamesir_build_mode_switch(uint8_t *out, size_t cap);

@@ -32,6 +32,8 @@
 #define GIP_EVENT_STATE      0x01   /* *state was updated (input or guide change) */
 #define GIP_EVENT_ANNOUNCE   0x02   /* device (re)announced itself: init must be (re)sent */
 #define GIP_EVENT_ALIVE      0x04   /* well-formed traffic was consumed */
+#define GIP_EVENT_POWER_OFF  0x08   /* status "powering off/resetting": held input was released */
+#define GIP_EVENT_STATUS     0x10   /* a Status message (the pad's periodic heartbeat) arrived */
 
 typedef struct {
     uint8_t  command;
@@ -49,6 +51,8 @@ typedef struct {
     int        have_input;    /* a 0x20 input report was decoded */
     int        started;       /* input or status seen: the pad left the Arrival state */
     uint32_t   input_len;     /* payload length of the last input report (diagnostics) */
+    int        dli;           /* Dynamic Latency Input follows the function map (Series X|S) */
+    unsigned long n_status;   /* Status messages from the pad (heartbeat detection) */
     pad_state_t last;         /* last state decoded from a 0x20 packet (PS bit excluded) */
 } gip_ctx_t;
 
@@ -59,6 +63,9 @@ void gip_init_ctx(gip_ctx_t *ctx, uint16_t vid, uint16_t pid);
 
 /* Restart the init sequence (after an announce). */
 void gip_restart_init(gip_ctx_t *ctx);
+
+/* Forgets held input (sticks, buttons, guide): the pad is gone or starting over. */
+void gip_reset_input(gip_ctx_t *ctx);
 
 /* Writes the next init packet for this device into out and returns its length,
  * or 0 when the sequence is complete. */
@@ -73,11 +80,15 @@ size_t gip_build_ack(const uint8_t *msg, size_t len, uint8_t *out, size_t cap);
 /* Decodes one USB transfer, which may pack several GIP messages. Each message
  * asking for an ACK is passed to ack_fn (may be NULL). Returns GIP_EVENT_* bits;
  * with GIP_EVENT_STATE, *state holds the full pad state (last input merged with
- * the guide button). Returns 0 when the transfer holds no well-formed message. */
+ * the guide button). Returns 0 when the transfer holds no well-formed message.
+ * Only the primary device (expansion index 0) drives the state: messages from
+ * attachments (headset, chatpad) are acknowledged but otherwise ignored. */
 int gip_process(gip_ctx_t *ctx, const uint8_t *buf, size_t len, pad_state_t *state,
                 gip_ack_fn ack_fn, void *ack_user);
 
-/* Stateless decode of one 0x20 input message into *st (guide not included). */
-int gip_parse_input(const uint8_t *buf, size_t len, pad_state_t *st);
+/* Stateless decode of one 0x20 input message into *st (guide not included).
+ * dli: the report may end with 8 bytes of Dynamic Latency Input data (Series X|S
+ * firmware 5.1+, 40+ byte payloads), which moves Share 8 bytes from the end. */
+int gip_parse_input(const uint8_t *buf, size_t len, int dli, pad_state_t *st);
 
 #endif /* GIP_H */

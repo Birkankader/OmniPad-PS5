@@ -107,10 +107,23 @@ static const usb_iface_info_t *first_match(const usb_config_info_t *cfg,
     return NULL;
 }
 
+static void route_use_iface(usb_input_route_t *route, const usb_iface_info_t *it)
+{
+    route->iface = it->number;
+    route->alt = it->alt;
+    route->proto = it->proto;
+    route->ep_in = it->ep_in;
+    route->ep_out = it->ep_out;
+    route->in_maxpkt = it->ep_in_maxpkt;
+    route->out_maxpkt = it->ep_out_maxpkt;
+    route->hid_report_len = it->hid_report_len;
+}
+
 int usb_desc_select_input(const usb_config_info_t *cfg, usb_input_route_t *route)
 {
     if (!cfg || !route) return 0;
     memset(route, 0, sizeof(*route));
+    route->aux_iface = 0xff;
 
     const usb_iface_info_t *it = NULL;
     usb_route_kind_t kind = USB_ROUTE_NONE;
@@ -128,21 +141,197 @@ int usb_desc_select_input(const usb_config_info_t *cfg, usb_input_route_t *route
     if (!it) return 0;
 
     route->kind = kind;
-    route->iface = it->number;
-    route->alt = it->alt;
-    route->ep_in = it->ep_in;
-    route->ep_out = it->ep_out;
-    route->in_maxpkt = it->ep_in_maxpkt;
-    route->out_maxpkt = it->ep_out_maxpkt;
-    route->hid_report_len = it->hid_report_len;
+    route_use_iface(route, it);
     for (int i = 0; i < cfg->n_ifaces; i++) {
+        const usb_iface_info_t *o = &cfg->ifaces[i];
         int seen = 0;
         for (int j = 0; j < i; j++) {
-            if (cfg->ifaces[j].number == cfg->ifaces[i].number) { seen = 1; break; }
+            if (cfg->ifaces[j].number == o->number) { seen = 1; break; }
         }
         if (!seen) route->iface_count++;
+        /* GIP audio interface: xpad and xone put it back to alt 0 before streaming */
+        if (kind == USB_ROUTE_GIP && is_gip(o) && o->number != it->number) {
+            if (route->aux_iface == 0xff) route->aux_iface = o->number;
+            if (o->number == route->aux_iface && o->alt == 1) route->aux_has_alt1 = 1;
+        }
     }
     return 1;
+}
+
+/* ---- HID report descriptor summary ----
+ * Only what interface selection and transfer sizing need: is there a Generic
+ * Desktop Joystick/Gamepad application collection, which report ID it uses and
+ * how long its input report is. */
+
+#define HID_MAX_PUSH 4
+
+typedef struct {
+    uint16_t usage_page;
+    uint32_t report_size;
+    uint32_t report_count;
+    uint8_t  report_id;
+} hid_globals_t;
+
+static int is_gamepad_usage(uint32_t usage)
+{
+    /* Generic Desktop: Joystick, Game Pad, Multi-axis Controller */
+    return usage == 0x00010004u || usage == 0x00010005u || usage == 0x00010008u;
+}
+
+static int is_non_pad_usage(uint32_t usage)
+{
+    /* Generic Desktop Mouse, Keyboard, Keypad, System Control; Consumer Control */
+    return usage == 0x00010002u || usage == 0x00010006u || usage == 0x00010007u ||
+           usage == 0x00010080u || usage == 0x000c0001u;
+}
+
+int usb_hid_parse_report_desc(const uint8_t *d, size_t len, usb_hid_info_t *out)
+{
+    if (!d || !out) return 0;
+    memset(out, 0, sizeof(*out));
+
+    uint32_t in_bits[256];           /* input bits per report ID */
+    memset(in_bits, 0, sizeof(in_bits));
+    hid_globals_t g, stack[HID_MAX_PUSH];
+    memset(&g, 0, sizeof(g));
+    int sp = 0;
+    uint32_t pending_usage = 0;      /* first local Usage (page << 16 | id) since the last main item */
+    int have_usage = 0;
+    int depth = 0;
+    int gamepad_depth = -1;          /* collection depth of the gamepad application, -1 = outside */
+    int gamepad_id_set = 0;
+    int other_depth = -1;            /* same for a keyboard/mouse/consumer application */
+    uint8_t pad_ids[32];             /* report IDs with inputs outside such collections */
+    memset(pad_ids, 0, sizeof(pad_ids));
+
+    size_t i = 0;
+    while (i < len) {
+        uint8_t prefix = d[i++];
+        if (prefix == 0xfe) {        /* long item: size, tag, data */
+            if (i + 2 > len) return 0;
+            size_t n = d[i];
+            i += 2;
+            if (i + n > len) return 0;
+            i += n;
+            continue;
+        }
+        size_t n = prefix & 0x03;
+        if (n == 3) n = 4;
+        if (i + n > len) return 0;
+        uint32_t v = 0;
+        for (size_t k = 0; k < n; k++) v |= (uint32_t)d[i + k] << (8 * k);
+        i += n;
+
+        uint8_t type = (prefix >> 2) & 0x03;
+        uint8_t tag = prefix >> 4;
+
+        if (type == 1) {             /* global */
+            switch (tag) {
+            case 0x0: g.usage_page = (uint16_t)v; break;
+            case 0x7: g.report_size = v; break;
+            case 0x8:
+                g.report_id = (uint8_t)v;
+                out->uses_report_ids = 1;
+                break;
+            case 0x9: g.report_count = v; break;
+            case 0xa: if (sp < HID_MAX_PUSH) stack[sp++] = g; break;
+            case 0xb: if (sp > 0) g = stack[--sp]; break;
+            default: break;
+            }
+        } else if (type == 2) {      /* local */
+            if (tag == 0x0 && !have_usage) {
+                pending_usage = (n == 4) ? v : (((uint32_t)g.usage_page << 16) | (v & 0xffff));
+                have_usage = 1;
+            }
+        } else if (type == 0) {      /* main */
+            switch (tag) {
+            case 0x8: {              /* Input */
+                /* The ID in effect at the collection's first Input: one declared before
+                 * it or inside it, never an Output/Feature ID or another collection's */
+                if (gamepad_depth >= 0 && !gamepad_id_set) {
+                    out->gamepad_report_id = g.report_id;
+                    gamepad_id_set = 1;
+                }
+                if (g.report_id != 0) {
+                    uint8_t *map = other_depth >= 0 ? out->ignore_ids : pad_ids;
+                    map[g.report_id >> 3] |= (uint8_t)(1u << (g.report_id & 7));
+                }
+                uint64_t bits = (uint64_t)g.report_size * g.report_count;
+                uint64_t total = (uint64_t)in_bits[g.report_id] + bits;
+                in_bits[g.report_id] = total > 0xffffu * 8u ? 0xffffu * 8u : (uint32_t)total;
+                break;
+            }
+            case 0xa:                /* Collection */
+                if (v == 0x01 && depth == 0 && gamepad_depth < 0 && !out->has_gamepad &&
+                    is_gamepad_usage(pending_usage)) {
+                    out->has_gamepad = 1;
+                    gamepad_depth = depth;
+                } else if (v == 0x01 && depth == 0 && is_non_pad_usage(pending_usage)) {
+                    other_depth = depth;
+                }
+                depth++;
+                break;
+            case 0xc:                /* End Collection */
+                if (depth > 0) depth--;
+                if (depth == gamepad_depth) gamepad_depth = -1;
+                if (depth == other_depth) other_depth = -1;
+                break;
+            default: break;
+            }
+            have_usage = 0;
+            pending_usage = 0;
+        }
+    }
+
+    for (int id = 0; id < 256; id++) {
+        if (!in_bits[id]) continue;
+        uint32_t bytes = (in_bits[id] + 7) / 8 + (id != 0 ? 1u : 0u);
+        if (bytes > 0xffff) bytes = 0xffff;
+        if (bytes > out->max_input_len) out->max_input_len = (uint16_t)bytes;
+    }
+    /* An ID that also carries gamepad or vendor input is not ignorable */
+    for (int k = 0; k < 32; k++) out->ignore_ids[k] &= (uint8_t)~pad_ids[k];
+    if (out->has_gamepad && in_bits[out->gamepad_report_id]) {
+        uint32_t bytes = (in_bits[out->gamepad_report_id] + 7) / 8 + (out->gamepad_report_id ? 1u : 0u);
+        out->gamepad_input_len = (uint16_t)(bytes > 0xffff ? 0xffff : bytes);
+    }
+    return 1;
+}
+
+int usb_desc_refine_hid_route(const usb_config_info_t *cfg, usb_input_route_t *route,
+                              usb_hid_fetch_fn fetch, void *user)
+{
+    if (!cfg || !route || !fetch || route->kind != USB_ROUTE_HID) return 0;
+
+    uint8_t buf[1024];
+    memset(buf, 0, sizeof(buf));
+    for (int i = 0; i < cfg->n_ifaces; i++) {
+        const usb_iface_info_t *it = &cfg->ifaces[i];
+        if (!it->ep_in || !is_hid_candidate(it) || it->hid_report_len == 0) continue;
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            if (cfg->ifaces[j].number == it->number) { seen = 1; break; }
+        }
+        if (seen) continue;
+
+        int n = fetch(user, it, buf, sizeof(buf));
+        usb_hid_info_t info;
+        if (n <= 0 || !usb_hid_parse_report_desc(buf, (size_t)n, &info)) continue;
+
+        if (info.has_gamepad) {
+            route_use_iface(route, it);
+            route->hid_report_id = info.uses_report_ids ? info.gamepad_report_id : 0;
+            route->hid_input_len = info.gamepad_input_len;
+            route->hid_max_input_len = info.max_input_len;
+            memcpy(route->hid_ignore_ids, info.ignore_ids, sizeof(route->hid_ignore_ids));
+            return 1;
+        }
+        if (it->number == route->iface) {
+            route->hid_max_input_len = info.max_input_len;
+            memcpy(route->hid_ignore_ids, info.ignore_ids, sizeof(route->hid_ignore_ids));
+        }
+    }
+    return 0;
 }
 
 const char *usb_route_name(usb_route_kind_t kind)

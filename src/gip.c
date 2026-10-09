@@ -47,12 +47,22 @@ void gip_init_ctx(gip_ctx_t *ctx, uint16_t vid, uint16_t pid)
     ctx->vid = vid;
     ctx->pid = pid;
     ctx->out_seq = 1;
+    /* Same quirk as xpad's MAP_SHARE_OFFSET and SDL's GIP_FEATURE_DYNAMIC_LATENCY_INPUT */
+    ctx->dli = (vid == 0x045e && pid == 0x0b12);
     pad_state_neutral(&ctx->last);
 }
 
 void gip_restart_init(gip_ctx_t *ctx)
 {
     if (ctx) ctx->init_step = 0;
+}
+
+void gip_reset_input(gip_ctx_t *ctx)
+{
+    if (!ctx) return;
+    pad_state_neutral(&ctx->last);
+    ctx->have_input = 0;
+    ctx->guide_down = 0;
 }
 
 size_t gip_next_init_packet(gip_ctx_t *ctx, uint8_t *out, size_t cap)
@@ -125,7 +135,7 @@ size_t gip_build_ack(const uint8_t *msg, size_t len, uint8_t *out, size_t cap)
     return 13;
 }
 
-int gip_parse_input(const uint8_t *buf, size_t len, pad_state_t *st)
+int gip_parse_input(const uint8_t *buf, size_t len, int dli, pad_state_t *st)
 {
     gip_header_t h;
     if (!st || !gip_parse_header(buf, len, &h)) return 0;
@@ -166,8 +176,14 @@ int gip_parse_input(const uint8_t *buf, size_t len, pad_state_t *st)
     out.ry = axis16_to_u8((int16_t)(p[12] | ((uint16_t)p[13] << 8)), 1);
 
     /* Share sits in the Console Function Map, the last 18 bytes of a report that
-     * carries it (32-byte payload in the spec); SDL assumes it for 0x3537 pads too */
-    if (h.length >= 32 && (p[h.length - 18] & 0x01)) out.buttons |= PAD_BTN_TOUCHPAD;
+     * carries it (32-byte payload in the spec); SDL assumes it for 0x3537 pads too.
+     * Series X|S payloads (SDL): firmware 5.0 32 bytes, Share at 14; 5.1 40 bytes,
+     * Share at 14; 5.5 44 bytes, Share at 18 - 8 bytes of latency data follow the
+     * map from 40 bytes on. */
+    uint32_t share_off = 0;
+    if (h.length >= 40 && dli) share_off = h.length - 26;
+    else if (h.length >= 32) share_off = h.length - 18;
+    if (share_off && (p[share_off] & 0x01)) out.buttons |= PAD_BTN_TOUCHPAD;
 
     *st = out;
     return 1;
@@ -178,11 +194,14 @@ static int gip_handle_message(gip_ctx_t *ctx, const uint8_t *msg, size_t len, co
 {
     if (h->command == 0x00) return 0;                       /* zero padding */
     if (h->options & GIP_OPT_CHUNK) return GIP_EVENT_ALIVE;  /* metadata/security fragments */
+    /* Attachments (headset, chatpad) use expansion indices 1..7. Their Hello repeats
+     * every 500 ms until answered on their own index, so it must not reset the pad. */
+    if (h->options & GIP_OPT_CLIENT_MASK) return GIP_EVENT_ALIVE;
 
     switch (h->command) {
     case GIP_CMD_INPUT: {
         pad_state_t in;
-        if (!gip_parse_input(msg, len, &in)) return GIP_EVENT_ALIVE;
+        if (!gip_parse_input(msg, len, ctx->dli, &in)) return GIP_EVENT_ALIVE;
         ctx->last = in;
         ctx->have_input = 1;
         ctx->started = 1;
@@ -197,18 +216,26 @@ static int gip_handle_message(gip_ctx_t *ctx, const uint8_t *msg, size_t len, co
         ctx->guide_down = down;
         return GIP_EVENT_ALIVE | GIP_EVENT_STATE;
     }
-    case GIP_CMD_STATUS:
+    case GIP_CMD_STATUS: {
+        if (!(h->options & GIP_OPT_INTERNAL)) return GIP_EVENT_ALIVE;
         ctx->started = 1;
-        return GIP_EVENT_ALIVE;
+        ctx->n_status++;
+        /* Power level (bits 7:6) 00 = "powering off/resetting", which [MS-GIPUSB]
+         * requires before the pad goes away; a 2.4 GHz receiver stays enumerated
+         * and would otherwise keep the last input held. */
+        if (h->length < 1 || (msg[h->header_len] & 0xc0) != 0) return GIP_EVENT_ALIVE | GIP_EVENT_STATUS;
+        int events = GIP_EVENT_ALIVE | GIP_EVENT_STATUS | GIP_EVENT_POWER_OFF;
+        if (ctx->have_input || ctx->guide_down) events |= GIP_EVENT_STATE;
+        gip_reset_input(ctx);
+        return events;
+    }
     case GIP_CMD_ANNOUNCE: {
+        if (!(h->options & GIP_OPT_INTERNAL)) return GIP_EVENT_ALIVE;
         /* Back in the Arrival state: whatever was held before is gone */
         int events = GIP_EVENT_ALIVE | GIP_EVENT_ANNOUNCE;
         ctx->started = 0;
-        if (ctx->have_input || ctx->guide_down) {
-            pad_state_neutral(&ctx->last);
-            ctx->guide_down = 0;
-            events |= GIP_EVENT_STATE;
-        }
+        if (ctx->have_input || ctx->guide_down) events |= GIP_EVENT_STATE;
+        gip_reset_input(ctx);
         return events;
     }
     default:

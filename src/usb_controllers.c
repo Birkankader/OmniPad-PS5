@@ -225,24 +225,8 @@ static void map_x360_buttons(uint16_t btn, pad_state_t *st)
     if (btn & 0x8000) st->buttons |= PAD_BTN_TRIANGLE;/* Y -> Triangle */
 }
 
-int usb_parse_x360_report(const uint8_t *data, size_t len, pad_state_t *st)
+static void x360_decode_payload(const uint8_t *p, pad_state_t *st)
 {
-    if (!data || !st) return 0;
-
-    /* Wired: 00 <size 0x14> btn btn LT RT LX LX LY LY RX RX RY RY (int16 LE).
-     * Some clones report 0x00 as size. Wireless receivers wrap the same payload
-     * behind a 4-byte header whose byte 1 is 0x01 for "pad data" (00 0F is their
-     * announce). Status messages (01 03 xx LED, 02 03 00, 03 03 xx rumble,
-     * 08 xx link) never start with 0x00 and are ignored. */
-    const uint8_t *p;
-    if (len >= 18 && data[0] == 0x00 && data[1] == 0x01) {
-        p = data + 4;
-    } else if (len >= 14 && data[0] == 0x00 && (data[1] == 0x00 || (data[1] >= 0x0e && data[1] != 0x0f))) {
-        p = data;
-    } else {
-        return 0;
-    }
-
     pad_state_t out;
     pad_state_neutral(&out);
     map_x360_buttons((uint16_t)(p[2] | ((uint16_t)p[3] << 8)), &out);
@@ -255,13 +239,45 @@ int usb_parse_x360_report(const uint8_t *data, size_t len, pad_state_t *st)
     out.rx = axis16_to_u8((int16_t)(p[10] | ((uint16_t)p[11] << 8)), 0);
     out.ry = axis16_to_u8((int16_t)(p[12] | ((uint16_t)p[13] << 8)), 1);
     *st = out;
+}
+
+int usb_parse_x360_report(const uint8_t *data, size_t len, pad_state_t *st)
+{
+    if (!data || !st) return 0;
+
+    /* Wired: 00 <size 0x14> btn btn LT RT LX LX LY LY RX RX RY RY (int16 LE).
+     * Some clones report 0x00 as size. Status messages (01 03 xx LED, 02 03 00,
+     * 03 03 xx rumble, 08 03 00 headset) never start with 0x00 and are ignored.
+     * Wireless receivers have their own framing: usb_parse_x360w_report(). */
+    if (len < 14 || data[0] != 0x00) return 0;
+    if (!(data[1] == 0x00 || (data[1] >= 0x0e && data[1] != 0x0f))) return 0;
+    x360_decode_payload(data, st);
     return 1;
+}
+
+x360w_pkt_t usb_parse_x360w_report(const uint8_t *data, size_t len, pad_state_t *st)
+{
+    if (!data || !st || len < 2) return X360W_PKT_UNKNOWN;
+
+    /* Presence change (xpad360w_process_packet): 08 80 = pad connected, 08 00 = gone */
+    if (data[0] & 0x08) {
+        if (data[1] & 0x80) return X360W_PKT_STATUS;
+        pad_state_neutral(st);
+        return X360W_PKT_LINK_LOST;
+    }
+    /* Pad data: 00 01 00 f0 + the wired payload. Battery (00 00 00 13), the
+     * trailer after button presses (00 00 00 f0) and announce (00 0f) are not input. */
+    if (len >= 18 && data[0] == 0x00 && data[1] == 0x01 && data[4] == 0x00) {
+        x360_decode_payload(data + 4, st);
+        return X360W_PKT_STATE;
+    }
+    return X360W_PKT_STATUS;
 }
 
 /* ---- GameSir HID protocol (G7 Pro / G7 Pro 8K / Tarantula HID mode) ----
  * Layout follows SDL's HIDAPI GameSir driver (src/joystick/hidapi/SDL_hidapi_gamesir.c).
  * Full report  : [0x43]? A1 C8 | BTN1 BTN2 BTN3 BTN4 LX LY RX RY (int16 BE, Y up = +) L2 R2 ...
- * USB simple   : BTN1 BTN2 HAT LX LY RX RY L2 R2           (exactly 9 bytes, sticks u8, 0 = up)
+ * USB simple   : [0x01]? BTN1 BTN2 HAT LX LY RX RY L2 R2   (9 bytes after the ID, sticks u8, 0 = up)
  * BT simple    : 02|07 LX LY RX RY HAT BTN1 BTN2 R2 L2 ... (>= 10 bytes)
  */
 #define GS_BTN1_A       0x01
@@ -298,9 +314,11 @@ static void gamesir_map_buttons(uint8_t b1, uint8_t b2, pad_state_t *st)
 
 static void gamesir_set_triggers(uint8_t l2, uint8_t r2, uint8_t b2, pad_state_t *st)
 {
-    /* Digital bits stay set even when hair-trigger stops clamp the analog travel */
-    st->l2 = (b2 & GS_BTN2_L2) && l2 < PAD_TRIGGER_DIGITAL_THRESHOLD ? 255 : l2;
-    st->r2 = (b2 & GS_BTN2_R2) && r2 < PAD_TRIGGER_DIGITAL_THRESHOLD ? 255 : r2;
+    /* Analog travel as reported (SDL ignores the digital bits). Only a pull that
+     * reports the digital bit with no analog value at all (hair-trigger lock)
+     * becomes a full press, so feathering a trigger is never rounded up. */
+    st->l2 = (b2 & GS_BTN2_L2) && l2 == 0 ? 255 : l2;
+    st->r2 = (b2 & GS_BTN2_R2) && r2 == 0 ? 255 : r2;
     if (st->l2 >= PAD_TRIGGER_DIGITAL_THRESHOLD) st->buttons |= PAD_BTN_L2;
     if (st->r2 >= PAD_TRIGGER_DIGITAL_THRESHOLD) st->buttons |= PAD_BTN_R2;
 }
@@ -344,15 +362,18 @@ int usb_parse_gamesir_hid_report(const uint8_t *data, size_t len, pad_state_t *s
         out.rx = axis16_to_u8(be16(p + 8), 0);
         out.ry = axis16_to_u8(be16(p + 10), 1);
         gamesir_set_triggers(p[12], p[13], p[1], &out);
-    } else if (len == 9) {
-        gamesir_map_buttons(data[0], data[1], &out);
-        map_hat8(data[2] & 0x0f, 0, &out);
-        out.lx = data[3];
-        out.ly = data[4];
-        out.rx = data[5];
-        out.ry = data[6];
-        gamesir_set_triggers(data[7], data[8], data[1], &out);
-    } else if (len >= 10 && (data[0] == 0x02 || data[0] == 0x07)) {
+    } else if (len == 9 || (len == 10 && data[0] == 0x01)) {
+        /* The same 9 bytes may follow a report ID 0x01 */
+        const uint8_t *s = (len == 10) ? data + 1 : data;
+        gamesir_map_buttons(s[0], s[1], &out);
+        map_hat8(s[2] & 0x0f, 0, &out);
+        out.lx = s[3];
+        out.ly = s[4];
+        out.rx = s[5];
+        out.ry = s[6];
+        gamesir_set_triggers(s[7], s[8], s[1], &out);
+    } else if ((len >= 10 && data[0] == 0x07) || (len >= 10 && len <= 16 && data[0] == 0x02)) {
+        /* 0x02 is bounded: a 32-byte GIP Hello (02 20 ss 1c ...) must never decode */
         p = data + 1;
         out.lx = p[0];
         out.ly = p[1];

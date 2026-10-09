@@ -40,6 +40,7 @@ typedef struct {
     usb_input_route_t     route;     /* interface/endpoints/protocol chosen from descriptors */
     gip_ctx_t             gip;
     int                   gip_reinit_pending; /* a GIP announce asked for the init sequence */
+    unsigned              n_hid_filtered;     /* non-pad HID reports dropped (first few are logged) */
 
 #ifdef __PROSPERO__
     struct usb_fs_endpoint endpoints[4];
@@ -211,6 +212,50 @@ static int read_config_descriptor(int fd, uint8_t *raw, size_t cap)
     return len;
 }
 
+/* xpad and xone send SET_INTERFACE(audio, alt 0) before streaming ("mandatory for
+ * certain third party devices"; the PowerA 20d6:200e reports Guide only after it).
+ * USB_SET_ALTINTERFACE skips the request when the alt is already active, which it
+ * is after SET_CONFIG, so send it raw, or else go through alt 1 so each switch is
+ * real. Must precede USB_FS_INIT: changing the alt setting tears down FS state. */
+static void gip_reset_audio_iface(usb_slot_device_t *sdev)
+{
+    uint8_t aif = sdev->route.aux_iface;
+    if (sdev->route.kind != USB_ROUTE_GIP || sdev->route.ep_in == 0 || aif == 0xff) return;
+
+    struct usb_ctl_request req;
+    memset(&req, 0, sizeof(req));
+    req.ucr_request.bmRequestType = 0x01; /* host to device, standard, interface */
+    req.ucr_request.bRequest = 0x0b;      /* SET_INTERFACE */
+    USETW(req.ucr_request.wValue, 0);
+    USETW(req.ucr_request.wIndex, aif);
+    USETW(req.ucr_request.wLength, 0);
+    if (ioctl(sdev->fd, USB_DO_REQUEST, &req) == 0) {
+        log_line("usb_hotplug: %s GIP audio interface %u -> SET_INTERFACE alt 0 sent",
+                 sdev->name, (unsigned)aif);
+        return;
+    }
+    int raw_err = errno; /* EPERM without PRIV_DRIVER (ugen_check_request) */
+    if (!sdev->route.aux_has_alt1) {
+        log_line("usb_hotplug: %s GIP audio interface %u -> SET_INTERFACE failed (%s), no alt 1",
+                 sdev->name, (unsigned)aif, strerror(raw_err));
+        return;
+    }
+
+    /* uai_interface_index is an index; GIP pads number their interfaces 0, 1 */
+    struct usb_alt_interface alt;
+    memset(&alt, 0, sizeof(alt));
+    alt.uai_interface_index = aif;
+    alt.uai_alt_index = 1;
+    int r1 = ioctl(sdev->fd, USB_SET_ALTINTERFACE, &alt);
+    int e1 = errno;
+    alt.uai_alt_index = 0;
+    int r0 = ioctl(sdev->fd, USB_SET_ALTINTERFACE, &alt);
+    int e0 = errno;
+    log_line("usb_hotplug: %s GIP audio interface %u -> SET_INTERFACE %s; alt 1 %s, alt 0 %s",
+             sdev->name, (unsigned)aif, strerror(raw_err),
+             r1 == 0 ? "ok" : strerror(e1), r0 == 0 ? "ok" : strerror(e0));
+}
+
 static int usb_fs_setup_device(usb_slot_device_t *sdev)
 {
     /* A protocol-only fallback route (descriptor unreadable) has no endpoints */
@@ -241,17 +286,7 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
         out_addr = is_xbox_one ? 0x02 : 0x01;
     }
 
-    /* xpad and xone select alt 0 of the GIP audio interface ("mandatory for certain
-     * third party devices"). It must precede USB_FS_INIT: it tears down FS state. */
-    if (sdev->route.kind == USB_ROUTE_GIP && sdev->route.iface_count > 1) {
-        struct usb_alt_interface alt;
-        memset(&alt, 0, sizeof(alt));
-        alt.uai_interface_index = 1;
-        alt.uai_alt_index = 0;
-        int r = ioctl(sdev->fd, USB_SET_ALTINTERFACE, &alt);
-        log_line("usb_hotplug: %s GIP audio interface alt 0 -> %s",
-                 sdev->name, r == 0 ? "ok" : strerror(errno));
-    }
+    gip_reset_audio_iface(sdev);
 
     struct usb_fs_init init;
     memset(sdev->endpoints, 0, sizeof(sdev->endpoints));
@@ -273,12 +308,18 @@ static int usb_fs_setup_device(usb_slot_device_t *sdev)
     uint8_t try_ins[] = { in_addr, 0x81, 0x82, 0x83, 0x84 };
     for (size_t i = 0; i < sizeof(try_ins); i++) {
         if (try_ins[i] == 0) continue;
-        /* One transfer per packet: a 64-byte buffer on a 32-byte endpoint would merge
-         * two full-size reports into one read */
+        /* One transfer per report: a 64-byte buffer on a 32-byte endpoint would merge
+         * two full-size reports into one read. A HID report longer than one packet
+         * (known from the report descriptor) needs a transfer that spans the packets
+         * and ends at the short one. */
         uint32_t want = sizeof(sdev->rx_buf);
         if (i == 0 && route_known && sdev->route.in_maxpkt >= 8 &&
             sdev->route.in_maxpkt <= sizeof(sdev->rx_buf)) {
             want = sdev->route.in_maxpkt;
+            if (sdev->route.kind == USB_ROUTE_HID && sdev->route.hid_max_input_len > want) {
+                want = sdev->route.hid_max_input_len > sizeof(sdev->rx_buf)
+                       ? sizeof(sdev->rx_buf) : sdev->route.hid_max_input_len;
+            }
         }
         memset(&open_in, 0, sizeof(open_in));
         open_in.max_bufsize = want;
@@ -363,6 +404,8 @@ static int usb_fs_reap(usb_slot_device_t *dev)
     } else if (complete.ep_index == dev->out_index) {
         dev->out_pending = 0;
         dev->out_ready = 1;
+        /* Whichever loop reaps it, a halted pipe must be cleared by the next send */
+        if (dev->endpoints[dev->out_index].status == USB_ERR_STALLED) dev->out_stalled = 1;
     }
     return complete.ep_index;
 }
@@ -392,7 +435,10 @@ static int usb_fs_recv_packet(usb_slot_device_t *dev, uint8_t *buffer, uint32_t 
         uint32_t ask_len = dev->in_xfer_len ? dev->in_xfer_len : sizeof(dev->rx_buf);
         if (ask_len > length) ask_len = length;
         dev->fs_len[dev->in_index] = ask_len;
-        ep->timeout = (uint16_t)timeout_ms;
+        /* No kernel timeout: the transfer stays armed across calls (in_pending) and
+         * timeout_ms only bounds this call's wait. A timeout racing a report the
+         * device already sent would discard it, and the device never resends it. */
+        ep->timeout = 0; /* USB_FS_TIMEOUT_NONE */
         ep->flags = USB_FS_FLAG_SINGLE_SHORT_OK | (dev->in_stalled ? USB_FS_FLAG_CLEAR_STALL : 0);
 
         struct usb_fs_start start;
@@ -469,7 +515,7 @@ static int usb_fs_send_packet(usb_slot_device_t *dev, const uint8_t *buffer, uin
     return -1;
 }
 
-static void gip_send_init_sequence(usb_slot_device_t *dev)
+static void gip_send_init_sequence(usb_slot_device_t *dev, int verbose)
 {
     uint8_t pkt[GIP_MAX_PACKET];
     size_t len;
@@ -481,7 +527,48 @@ static void gip_send_init_sequence(usb_slot_device_t *dev)
         else sent++;
         usleep(5000);
     }
-    log_line("usb_hotplug: slot %d GIP init sequence sent (%d ok, %d failed)", dev->slot, sent, failed);
+    if (verbose) {
+        log_line("usb_hotplug: slot %d GIP init sequence sent (%d ok, %d failed)", dev->slot, sent, failed);
+    }
+}
+
+typedef struct {
+    int fd;
+    int slot;
+} hid_fetch_ctx_t;
+
+/* GET_DESCRIPTOR(HID report) for one interface, logged so a new pad's report
+ * layout can be read straight from anypad.log. */
+static int fetch_hid_report_desc(void *user, const usb_iface_info_t *it, uint8_t *buf, size_t cap)
+{
+    hid_fetch_ctx_t *c = (hid_fetch_ctx_t *)user;
+    uint16_t want = it->hid_report_len;
+    if (want > cap) want = (uint16_t)cap;
+
+    struct usb_ctl_request req;
+    memset(&req, 0, sizeof(req));
+    req.ucr_request.bmRequestType = 0x81; /* device to host, standard, interface */
+    req.ucr_request.bRequest = 0x06;      /* GET_DESCRIPTOR */
+    USETW(req.ucr_request.wValue, 0x2200); /* HID report descriptor, index 0 */
+    USETW(req.ucr_request.wIndex, it->number);
+    USETW(req.ucr_request.wLength, want);
+    req.ucr_data = buf;
+    req.ucr_flags = USB_SHORT_XFER_OK;
+    if (ioctl(c->fd, USB_DO_REQUEST, &req) != 0) {
+        log_line("usb_hotplug: slot %d HID report descriptor of interface %u unreadable (%s)",
+                 c->slot, (unsigned)it->number, strerror(errno));
+        return -1;
+    }
+    if (req.ucr_actlen <= 0) {
+        log_line("usb_hotplug: slot %d HID report descriptor of interface %u is empty",
+                 c->slot, (unsigned)it->number);
+        return -1;
+    }
+    int n = req.ucr_actlen < (int)want ? (int)req.ucr_actlen : (int)want;
+    char what[24];
+    snprintf(what, sizeof(what), "hid-report if%u", (unsigned)it->number);
+    log_hex_block(what, c->slot, buf, n);
+    return n;
 }
 
 
@@ -532,6 +619,7 @@ static void gip_ack_cb(void *user, const uint8_t *ack, size_t len)
 typedef enum {
     PKT_STATE = 0,   /* decoded a full pad state */
     PKT_IGNORED,     /* valid protocol traffic without input meaning */
+    PKT_RELEASE,     /* the pad is powering off or left its receiver: drop held input */
     PKT_UNPARSED     /* unknown bytes */
 } pkt_kind_t;
 
@@ -546,23 +634,91 @@ static pkt_kind_t decode_packet(usb_slot_device_t *dev, const uint8_t *report, i
         int ev = gip_process(&dev->gip, report, (size_t)n, st, gip_ack_cb, dev);
         /* Hello: the pad waits in the Arrival state for Set Device State START */
         if (ev & GIP_EVENT_ANNOUNCE) dev->gip_reinit_pending = 1;
+        if (ev & GIP_EVENT_POWER_OFF) {
+            log_line("usb_hotplug: slot %d GIP status: pad powering off - input released", dev->slot);
+            return PKT_RELEASE;
+        }
         if (ev & GIP_EVENT_STATE) return PKT_STATE;
         return ev ? PKT_IGNORED : PKT_UNPARSED;
     }
     case USB_ROUTE_X360:
+        if (dev->route.proto == 0x81) {
+            /* Wireless receiver channel: own framing, plus "pad gone" packets */
+            x360w_pkt_t w = usb_parse_x360w_report(report, (size_t)n, st);
+            if (w == X360W_PKT_LINK_LOST) {
+                log_line("usb_hotplug: slot %d wireless pad left the receiver - input released", dev->slot);
+                return PKT_RELEASE;
+            }
+            if (w == X360W_PKT_STATE) return PKT_STATE;
+            return w == X360W_PKT_STATUS ? PKT_IGNORED : PKT_UNPARSED;
+        }
         return usb_parse_x360_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
     default:
         break;
     }
 
     if (dev->type == CTRL_GAMESIR) {
-        return usb_parse_gamesir_hid_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
+        if (dev->route.kind == USB_ROUTE_HID) {
+            /* Full reports identify themselves; on the 8K pads they come from a vendor
+             * collection (report ID 0x43), not from the gamepad collection */
+            if ((n >= 3 && report[0] == 0x43 && report[1] == 0xa1 && report[2] == 0xc8) ||
+                (n >= 2 && report[0] == 0xa1 && report[1] == 0xc8)) {
+                return usb_parse_gamesir_hid_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
+            }
+            /* Keyboard, mouse and consumer reports the descriptor declares are not pad state */
+            if (usb_route_hid_id_ignored(&dev->route, report[0])) {
+                if (dev->n_hid_filtered++ < 3) log_hex_block("hid-filtered", dev->slot, report, n < 16 ? n : 16);
+                return PKT_IGNORED;
+            }
+            /* The 9-byte simple layout may sit behind the gamepad report ID; the
+             * Bluetooth-style 07/02 layouts carry their ID as part of the frame */
+            uint8_t id = dev->route.hid_report_id;
+            if (id != 0 && report[0] == id && n == 10 && id != 0x07 && id != 0x02) {
+                return usb_parse_gamesir_hid_report(report + 1, 9, st) ? PKT_STATE : PKT_UNPARSED;
+            }
+            return usb_parse_gamesir_hid_report(report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
+        }
+        /* No usable descriptor: a GIP Hello (02 20 ss 1c, 28-byte payload) reveals
+         * a GIP pad that only needs its init sequence */
+        if (n >= 32 && report[0] == GIP_CMD_ANNOUNCE && report[1] == GIP_OPT_INTERNAL &&
+            report[3] == 0x1c) {
+            log_line("usb_hotplug: slot %d GIP Hello on a route-less GameSir pad - switching to GIP", dev->slot);
+            dev->route.kind = USB_ROUTE_GIP;
+            dev->gip_reinit_pending = 1;
+            return PKT_IGNORED;
+        }
+        /* GameSir HID first, then strict wired XInput (the two never overlap) */
+        return usb_parse_input_report(CTRL_GAMESIR, report, (size_t)n, st) ? PKT_STATE : PKT_UNPARSED;
     }
 
     /* Legacy VID/PID heuristics (Machenike HID mode, DS4, Switch Pro, DS3, generic HID) */
     if (usb_parse_input_report(dev->type, report, (size_t)n, st)) return PKT_STATE;
     if (usb_parse_input_report(CTRL_GENERIC_HID, report, (size_t)n, st)) return PKT_STATE;
     return PKT_UNPARSED;
+}
+
+/* No traffic at all for this long means the link is gone even though the device
+ * (a 2.4 GHz receiver) is still enumerated. [MS-GIPUSB] has a started pad send
+ * Status every 20 s; once a pad has shown that heartbeat (two Status messages
+ * 15-25 s apart), two missed ones are enough. Report-on-change pads without it
+ * only have to outlast a stick or trigger held perfectly still. */
+#define GIP_SILENCE_RELEASE_MS   45000
+#define EVENT_SILENCE_RELEASE_MS 60000
+#define GIP_HEARTBEAT_MIN_MS     15000
+#define GIP_HEARTBEAT_MAX_MS     25000
+
+/* Pushes a neutral state (keeping the slot's identity) so a held input does not
+ * outlive the link that reported it. */
+static void release_held_input(usb_slot_device_t *dev, pad_state_t *last_state)
+{
+    pad_state_t n;
+    pad_state_neutral(&n);
+    n.conn_type = last_state->conn_type;
+    n.vid = last_state->vid;
+    n.pid = last_state->pid;
+    memcpy(n.controller_name, last_state->controller_name, sizeof(n.controller_name));
+    *last_state = n;
+    if (!vpad_slot_is_free(dev->slot)) vpad_update(dev->slot, last_state);
 }
 
 static void *usb_reader_worker(void *arg)
@@ -575,6 +731,9 @@ static void *usb_reader_worker(void *arg)
     long last_push_time = 0;
 
     long last_data_time = now_ms();
+    long last_status_time = 0;
+    unsigned long n_status = 0;
+    int gip_heartbeat = 0;           /* the pad sends the periodic GIP Status */
 #ifdef __PROSPERO__
     long last_led_time = 0;
     long last_init_time = 0;
@@ -602,7 +761,7 @@ static void *usb_reader_worker(void *arg)
     int is_genuine_x360 = (dev->type == CTRL_XBOX_XINPUT && dev->vid == 0x045e && dev->pid == 0x028e);
     if (dev->use_fs && dev->route.kind == USB_ROUTE_GIP) {
         if (dev->has_out) {
-            gip_send_init_sequence(dev);
+            gip_send_init_sequence(dev, 1);
             init_attempts = 1;
             last_init_time = now_ms();
         } else {
@@ -628,21 +787,28 @@ static void *usb_reader_worker(void *arg)
         }
 
         if (dev->use_fs && dev->has_out && dev->route.kind == USB_ROUTE_GIP) {
+            if (dev->gip.started) init_attempts = 0;
             if (dev->gip_reinit_pending && (cur_time - last_init_time >= 400)) {
                 /* Hello repeats every 500 ms until the pad is started */
                 dev->gip_reinit_pending = 0;
                 n_announces++;
-                if (n_announces <= 5 || (n_announces % 20) == 0) {
+                int verbose = (n_announces <= 5 || (n_announces % 20) == 0);
+                if (verbose) {
                     log_line("usb_hotplug: slot %d GIP announce #%lu - sending init", dev->slot, n_announces);
                 }
                 last_init_time = cur_time;
-                gip_send_init_sequence(dev);
-            } else if (!dev->gip.started && init_attempts < 5 && (cur_time - last_init_time > 2000)) {
-                /* Neither input nor status yet: the first init may have been dropped while booting */
+                gip_send_init_sequence(dev, verbose);
+            } else if (!dev->gip.started &&
+                       (cur_time - last_init_time > (init_attempts < 5 ? 3000 : 15000))) {
+                /* Neither input nor status: the first init may have been dropped while
+                 * booting, or a receiver's pad is still off. Keep trying, slower later. */
                 init_attempts++;
                 last_init_time = cur_time;
-                log_line("usb_hotplug: slot %d GIP pad silent - retrying init (%d/5)", dev->slot, init_attempts);
-                gip_send_init_sequence(dev);
+                int verbose = (init_attempts <= 5 || (init_attempts % 20) == 0);
+                if (verbose) {
+                    log_line("usb_hotplug: slot %d GIP pad silent - retrying init (#%d)", dev->slot, init_attempts);
+                }
+                gip_send_init_sequence(dev, verbose);
             }
         }
 #endif
@@ -674,6 +840,16 @@ static void *usb_reader_worker(void *arg)
             }
 
             pkt_kind_t kind = decode_packet(dev, report, n, &st);
+            if (dev->gip.n_status != n_status) {
+                n_status = dev->gip.n_status;
+                long gap = cur_time - last_status_time;
+                if (!gip_heartbeat && last_status_time &&
+                    gap >= GIP_HEARTBEAT_MIN_MS && gap <= GIP_HEARTBEAT_MAX_MS) {
+                    gip_heartbeat = 1;
+                    log_line("usb_hotplug: slot %d GIP Status heartbeat every ~%ld s", dev->slot, gap / 1000);
+                }
+                last_status_time = cur_time;
+            }
             if (!gip_len_logged && dev->gip.have_input) {
                 gip_len_logged = 1;
                 log_line("usb_hotplug: slot %d GIP input report payload is %u bytes",
@@ -702,6 +878,11 @@ static void *usb_reader_worker(void *arg)
                 }
             } else if (kind == PKT_IGNORED) {
                 /* Heartbeats / status messages prove the link is alive */
+                last_data_time = cur_time;
+            } else if (kind == PKT_RELEASE) {
+                /* Never re-arms a freed 2.4G slot: the pad is going, not coming */
+                release_held_input(dev, &last_state);
+                have_state = 0;
                 last_data_time = cur_time;
             } else {
                 n_unparsed++;
@@ -736,6 +917,25 @@ static void *usb_reader_worker(void *arg)
             }
         }
 
+        /* A silent link (pad off, battery dead, out of range behind a receiver)
+         * must not keep its last input held forever through the re-submit below */
+        long silence_limit = gip_heartbeat ? GIP_SILENCE_RELEASE_MS : EVENT_SILENCE_RELEASE_MS;
+        if (cur_time - last_data_time > silence_limit) {
+            if (event_driven && have_state) {
+                log_line("usb_hotplug: slot %d no traffic for %ld s - releasing held input",
+                         dev->slot, (cur_time - last_data_time) / 1000);
+                release_held_input(dev, &last_state);
+                have_state = 0;
+            }
+            if (dev->route.kind == USB_ROUTE_GIP) {
+                /* Forget guide/input so a pad that comes back without a Hello does not
+                 * replay them; only a pad with a proven heartbeat is surely gone and
+                 * needs START again (re-initialising an idle live pad is pointless) */
+                gip_reset_input(&dev->gip);
+                if (gip_heartbeat) dev->gip.started = 0;
+            }
+        }
+
         /* Re-submit the last state of report-on-change pads; otherwise vpad_poll's 500 ms
          * stale-state reset would release a stick or button that is simply being held. */
         if (event_driven && have_state && (cur_time - last_push_time >= 100) &&
@@ -744,7 +944,9 @@ static void *usb_reader_worker(void *arg)
             last_push_time = cur_time;
         }
 
-        usleep(4000); /* ~250 Hz polling tick */
+        /* After a packet, re-arm the IN transfer at once: the pad may report every
+         * 1-2 ms. Idle reads already waited in select(), errors back off here. */
+        if (n <= 0) usleep(4000);
     }
     log_line("usb_hotplug: Reader thread stopped for slot %d", dev->slot);
     return NULL;
@@ -827,6 +1029,30 @@ static int find_free_slot(void)
     return -1;
 }
 
+#ifdef __PROSPERO__
+/* Which kernel driver (if any) holds each interface: a console HID driver owning
+ * the gamepad interface would explain a pad that enumerates but stays silent. */
+static void log_iface_drivers(int fd, int slot, const uint8_t *cfg, int cfg_len)
+{
+    if (cfg_len < 5 || cfg[1] != 0x02) return;
+    int n_ifaces = cfg[4];
+    for (int i = 0; i < n_ifaces && i < 8; i++) {
+        char name[128];
+        struct usb_gen_descriptor ugd;
+        memset(name, 0, sizeof(name));
+        memset(&ugd, 0, sizeof(ugd));
+        ugd.ugd_data = name;
+        ugd.ugd_maxlen = sizeof(name) - 1;
+        ugd.ugd_iface_index = (uint8_t)i;
+        if (ioctl(fd, USB_GET_IFACE_DRIVER, &ugd) == 0) {
+            log_line("usb_hotplug: slot %d interface %d kernel driver: %s", slot, i, name[0] ? name : "none");
+        } else {
+            log_line("usb_hotplug: slot %d interface %d kernel driver: unknown (%s)", slot, i, strerror(errno));
+        }
+    }
+}
+#endif
+
 /* Reads the active configuration descriptor and picks the gamepad interface.
  * Host builds have no descriptor access: the route stays NONE (legacy behavior). */
 static usb_input_route_t usb_compute_route(int fd, uint16_t vid, uint16_t pid,
@@ -834,6 +1060,7 @@ static usb_input_route_t usb_compute_route(int fd, uint16_t vid, uint16_t pid,
 {
     usb_input_route_t route;
     memset(&route, 0, sizeof(route));
+    route.aux_iface = 0xff;
     *raw_len = 0;
 #ifdef __PROSPERO__
     int len = read_config_descriptor(fd, raw, (size_t)cap);
@@ -853,14 +1080,16 @@ static usb_input_route_t usb_compute_route(int fd, uint16_t vid, uint16_t pid,
     } else if (route.kind == USB_ROUTE_NONE) {
         /* Descriptor unreadable: protocol implied by well-known IDs; endpoints are
          * then searched the legacy way (ep_in stays 0) */
-        if ((vid == 0x3537 && pid == 0x10a8) ||
+        if ((vid == 0x3537 && (pid == 0x10a8 || pid == 0x1010)) ||
             (vid == 0x045e && (pid == 0x02d1 || pid == 0x02dd || pid == 0x02e3 || pid == 0x02ea ||
                                pid == 0x0b00 || pid == 0x0b12))) {
             route.kind = USB_ROUTE_GIP;
-        } else if (vid == 0x3537 && pid == 0x10a9) {
+        } else if (vid == 0x3537 && (pid == 0x10a9 || pid == 0x1004 || pid == 0x100f)) {
+            /* 1004/100f/1010 as listed in Linux xpad */
             route.kind = USB_ROUTE_X360;
         }
     }
+    if (route.kind != USB_ROUTE_GIP) route.aux_iface = 0xff;
 #else
     (void)fd; (void)vid; (void)pid; (void)raw; (void)cap;
 #endif
@@ -946,12 +1175,30 @@ static void probe_usb_devices(void)
                      ctrl_name, path, slot, vid, pid, usb_route_name(route.kind),
                      (unsigned)route.iface, route.ep_in, route.ep_out);
             if (cfg_len > 0) log_hex_block("config", slot, cfg_raw, cfg_len);
+#ifdef __PROSPERO__
+            log_iface_drivers(fd, slot, cfg_raw, cfg_len);
+            if (route.kind == USB_ROUTE_HID && cfg_len > 0) {
+                /* Only now, once per claim: the report descriptors say which HID
+                 * interface is the gamepad and how long its reports are */
+                usb_config_info_t cfg;
+                if (usb_desc_parse_config(cfg_raw, (size_t)cfg_len, &cfg) > 0) {
+                    hid_fetch_ctx_t hctx = { fd, slot };
+                    int found = usb_desc_refine_hid_route(&cfg, &route, fetch_hid_report_desc, &hctx);
+                    log_line("usb_hotplug: slot %d HID gamepad collection %s (iface=%u IN=0x%02x report id=%u len=%u max=%u)",
+                             slot, found ? "found" : "not found", (unsigned)route.iface, route.ep_in,
+                             (unsigned)route.hid_report_id, (unsigned)route.hid_input_len,
+                             (unsigned)route.hid_max_input_len);
+                }
+            }
+#endif
 
-            /* Xbox 360-style wake-up / LED handshake only fits XInput and legacy interfaces;
-             * GIP pads and GameSir HID pads are initialised by the reader thread. */
-            if (route.kind != USB_ROUTE_GIP &&
-                !(ctype == CTRL_GAMESIR && route.kind != USB_ROUTE_X360)) {
-                usb_init_controller_handshake(fd, ctype == CTRL_GAMESIR ? CTRL_XBOX_XINPUT : ctype);
+            /* The XInput wake-up follows the interface, whatever the VID suggests (third-party
+             * 360 pads listed as generic HID need it too); GIP pads and GameSir HID pads are
+             * initialised by the reader thread. */
+            if (route.kind == USB_ROUTE_X360) {
+                usb_init_controller_handshake(fd, CTRL_XBOX_XINPUT);
+            } else if (route.kind != USB_ROUTE_GIP && ctype != CTRL_GAMESIR) {
+                usb_init_controller_handshake(fd, ctype);
             }
 
             usb_slot_device_t *sdev = &g_usb_hotplug.devices[slot];
