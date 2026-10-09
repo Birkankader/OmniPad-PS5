@@ -56,9 +56,9 @@ The engine is organized into **6 core layers**:
 
 #### A. Wired USB Cables & 2.4GHz Wireless Dongles
 1. The `usb_hotplug.c` module continuously polls for device connections across the USB bus.
-2. Upon detecting an insertion, it reads the Vendor ID (VID) and Product ID (PID) from the USB device descriptor.
+2. Upon detecting an insertion, it reads the Vendor ID (VID) and Product ID (PID) from the USB device descriptor, then the configuration descriptor, and picks the interface that carries gamepad input (Xbox GIP > XInput > HID > first interrupt IN). For HID interfaces it also reads the HID report descriptor to find the Joystick/Gamepad collection, its report ID and its report length. The descriptors and the kernel driver bound to each interface are written to `anypad.log`.
 3. If the controller requires a proprietary initialization handshake (e.g., **Nintendo Switch Pro** via USB-C or **DualShock 3** requiring magic wake packet `0xF4 0x42 0x03`), the engine transmits the exact initialization sequence.
-4. A dedicated asynchronous thread polls the IN interrupt endpoint at **250 Hz** (~4ms latency).
+4. A dedicated asynchronous thread keeps an IN interrupt transfer armed and re-arms it as soon as a report arrives, so pads reporting at 500-1000 Hz are read at their own rate. Report-on-change pads (GIP, XInput, GameSir) have their last state re-submitted every 100 ms; when the pad reports that it is powering off or has left its receiver, or the link stays silent (45 s for a GIP pad that has shown the 20 s status heartbeat, i.e. two missed heartbeats; 60 s otherwise), held input is released. HID reports that the report descriptor assigns to keyboard, mouse or consumer collections are never read as pad input.
 
 #### B. Wireless Bluetooth (Console's Internal Radio — Roadmap / v1.1.0)
 > ⚠️ **Roadmap Notice:** In **v1.0.4**, direct Bluetooth communication via the console's internal radio is intentionally dormant in `main.c` while the BLE SMP cryptographic handshake is being completed. Direct pairing through the console antenna is scheduled for **v1.1.0**. In v1.0.4, all wireless gaming is handled through physical USB adapters (e.g. 8BitDo or manufacturer 2.4GHz dongles).
@@ -72,7 +72,7 @@ The engine is organized into **6 core layers**:
 
 Different manufacturers arrange button bits, analog sticks, and triggers in incompatible binary formats:
 - **DualShock 4:** 64-byte USB report with digital buttons packed into 4-bit nibbles.
-- **Xbox (XInput & GIP):** 20-byte report for Xbox 360 / clones, and 18+ byte GIP reports (`0x20` / Guide `0x07`) for wired Xbox One / Series X|S. The protocol is picked from the interface descriptors (`usb_desc.c`), so third-party GIP/XInput pads work regardless of vendor ID; non-input traffic (announce, status, ACK) is consumed instead of being guessed as a HID report.
+- **Xbox (XInput & GIP):** 20-byte report for Xbox 360 / clones, and 18+ byte GIP reports (`0x20` / Guide `0x07`) for wired Xbox One / Series X|S. The protocol is picked from the interface descriptors (`usb_desc.c`), so third-party GIP/XInput pads work regardless of vendor ID; non-input traffic (announce, status, ACK) is consumed instead of being guessed as a HID report. Xbox 360 wireless receivers (`FF/5D/81`) are decoded with their own framing, and GIP attachments (headset, chatpad) never touch the pad state.
 - **GameSir HID:** 9-byte simple report (`3537:1022`) and the `A1 C8` full report of the 8K models.
 - **Nintendo Switch Pro:** Compact 12-bit packed analog coordinates over 64-byte USB report after handshake.
 

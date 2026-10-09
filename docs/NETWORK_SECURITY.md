@@ -57,7 +57,7 @@ Run the host-compatible tests under AddressSanitizer and UndefinedBehaviorSaniti
 make host-test-sanitize
 ```
 
-The tests cover host parsers, Bluetooth packet boundaries and device-to-slot lookup, TCP frame parsing and local listener lifecycle, HTTP parsing/authorization/JSON serialization, and injected USB lifecycle failures for setup, slot reservation, thread creation, joining, and cleanup ordering. USB ioctl behavior, ProsperoOS ABI interactions, virtual DualSense behavior, ShellUI injection, firmware compatibility, and physical controller behavior require the PS5 SDK or hardware and are not simulated by the host suite. A host test pass is not a PS5 runtime validation.
+The tests cover host parsers (including Xbox GIP, Xbox 360 wired/wireless and GameSir HID decoding), USB configuration and HID report descriptor routing, Bluetooth packet boundaries and device-to-slot lookup, TCP frame parsing and local listener lifecycle, HTTP parsing/authorization/JSON serialization, and injected USB lifecycle failures for setup, slot reservation, thread creation, joining, and cleanup ordering. USB ioctl behavior, ProsperoOS ABI interactions, virtual DualSense behavior, ShellUI injection, firmware compatibility, and physical controller behavior require the PS5 SDK or hardware and are not simulated by the host suite. A host test pass is not a PS5 runtime validation.
 
 ## PS5 manual test matrix
 
