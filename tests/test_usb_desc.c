@@ -1,0 +1,445 @@
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "../src/usb_desc.h"
+
+/* Configuration descriptors captured from a real GameSir G7 Pro (Windows hub IOCTL dump). */
+
+/* 3537:10A8 "GameSir-G7 Pro" wired, Xbox GIP mode */
+static const uint8_t g7pro_gip_cfg[] = {
+    0x09, 0x02, 0x40, 0x00, 0x02, 0x01, 0x00, 0xa0, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x02, 0xff, 0x47, 0xd0, 0x00,
+    0x07, 0x05, 0x02, 0x03, 0x40, 0x00, 0x04,
+    0x07, 0x05, 0x82, 0x03, 0x40, 0x00, 0x02,
+    0x09, 0x04, 0x01, 0x00, 0x00, 0xff, 0x47, 0xd0, 0x00,
+    0x09, 0x04, 0x01, 0x01, 0x02, 0xff, 0x47, 0xd0, 0x00,
+    0x07, 0x05, 0x03, 0x01, 0xe4, 0x00, 0x01,
+    0x07, 0x05, 0x83, 0x01, 0xe4, 0x00, 0x01
+};
+
+/* 3537:10A9 "Xbox 360 Controller for Windows": XInput interface + keyboard/mouse/vendor HID interface */
+static const uint8_t g7pro_x360_cfg[] = {
+    0x09, 0x02, 0x50, 0x00, 0x02, 0x01, 0x00, 0x80, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x02, 0xff, 0x5d, 0x01, 0x00,
+    0x10, 0x21, 0x10, 0x01, 0x01, 0x24, 0x82, 0x14, 0x03, 0x00, 0x03, 0x13, 0x02, 0x00, 0x03, 0x00,
+    0x07, 0x05, 0x82, 0x03, 0x20, 0x00, 0x01,
+    0x07, 0x05, 0x02, 0x03, 0x20, 0x00, 0x08,
+    0x09, 0x04, 0x01, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00,
+    0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0xd6, 0x00,
+    0x07, 0x05, 0x84, 0x03, 0x40, 0x00, 0x01,
+    0x07, 0x05, 0x04, 0x03, 0x40, 0x00, 0x05
+};
+
+/* Genuine Xbox 360 wired layout: gamepad, headset, unknown, security interfaces */
+static const uint8_t x360_genuine_cfg[] = {
+    0x09, 0x02, 0x6f, 0x00, 0x04, 0x01, 0x00, 0xa0, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x02, 0xff, 0x5d, 0x01, 0x00,
+    0x11, 0x21, 0x00, 0x01, 0x01, 0x25, 0x81, 0x14, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x08, 0x00, 0x00,
+    0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x04,
+    0x07, 0x05, 0x01, 0x03, 0x20, 0x00, 0x08,
+    0x09, 0x04, 0x01, 0x00, 0x04, 0xff, 0x5d, 0x03, 0x00,
+    0x07, 0x05, 0x82, 0x03, 0x20, 0x00, 0x02,
+    0x07, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04,
+    0x07, 0x05, 0x83, 0x03, 0x20, 0x00, 0x40,
+    0x07, 0x05, 0x03, 0x03, 0x20, 0x00, 0x10,
+    0x09, 0x04, 0x02, 0x00, 0x01, 0xff, 0x5d, 0x02, 0x00,
+    0x07, 0x05, 0x84, 0x03, 0x20, 0x00, 0x10,
+    0x09, 0x04, 0x03, 0x00, 0x00, 0xff, 0xfd, 0x13, 0x04
+};
+
+/* DualShock 4 style: audio interfaces first (iso), HID gamepad on interface 3 */
+static const uint8_t ds4_like_cfg[] = {
+    0x09, 0x02, 0x44, 0x00, 0x02, 0x01, 0x00, 0xc0, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+    0x09, 0x04, 0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00,
+    0x09, 0x05, 0x01, 0x09, 0x88, 0x01, 0x04, 0x00, 0x00,
+    0x09, 0x04, 0x03, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00,
+    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0xfb, 0x01,
+    0x07, 0x05, 0x84, 0x03, 0x40, 0x00, 0x05,
+    0x07, 0x05, 0x03, 0x03, 0x40, 0x00, 0x05
+};
+
+/* Boot keyboard only: must never be routed as HID gamepad */
+static const uint8_t keyboard_cfg[] = {
+    0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00,
+    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x3f, 0x00,
+    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a
+};
+
+static void test_g7pro_gip_route(void)
+{
+    printf("Testing GameSir G7 Pro GIP descriptor routing... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(g7pro_gip_cfg, sizeof(g7pro_gip_cfg), &cfg) == 3);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_GIP);
+    assert(route.iface == 0);
+    assert(route.alt == 0);
+    assert(route.ep_in == 0x82);
+    assert(route.ep_out == 0x02);
+    assert(route.in_maxpkt == 64);
+    /* Audio interface 1 (alt 0 empty, alt 1 isochronous) for the xpad SET_INTERFACE */
+    assert(route.aux_iface == 1 && route.aux_has_alt1 == 1);
+    assert(route.iface_count == 2);
+    printf("OK!\n");
+}
+
+static void test_g7pro_x360_route_skips_hid_keyboard_mouse(void)
+{
+    printf("Testing GameSir G7 Pro XInput routing ignores HID kbd/mouse interface... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(g7pro_x360_cfg, sizeof(g7pro_x360_cfg), &cfg) == 2);
+    /* The XInput 0x21 class descriptor must not be mistaken for a HID descriptor */
+    assert(cfg.ifaces[0].hid_report_len == 0);
+    assert(cfg.ifaces[1].hid_report_len == 0xd6);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_X360);
+    assert(route.iface == 0);
+    assert(route.proto == 0x01); /* wired framing, not the 0x81 receiver channel */
+    assert(route.ep_in == 0x82);
+    assert(route.ep_out == 0x02);
+    assert(route.in_maxpkt == 32);
+    assert(route.aux_iface == 0xff);
+    printf("OK!\n");
+}
+
+/* Xbox 360 wireless receiver (045e:0719): four FF/5D/81 controller channels */
+static const uint8_t x360_receiver_cfg[] = {
+    0x09, 0x02, 0x34, 0x00, 0x01, 0x01, 0x00, 0xa0, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x02, 0xff, 0x5d, 0x81, 0x00,
+    0x14, 0x22, 0x00, 0x01, 0x13, 0x81, 0x1d, 0x00, 0x17, 0x01, 0x02, 0x08, 0x13, 0x01, 0x0c, 0x00, 0x0c, 0x01, 0x02, 0x08,
+    0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x01,
+    0x07, 0x05, 0x01, 0x03, 0x20, 0x00, 0x08
+};
+
+static void test_x360_receiver_route_is_wireless(void)
+{
+    printf("Testing Xbox 360 receiver channel keeps its wireless protocol... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(x360_receiver_cfg, sizeof(x360_receiver_cfg), &cfg) == 1);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_X360 && route.proto == 0x81);
+    assert(route.ep_in == 0x81 && route.ep_out == 0x01);
+    printf("OK!\n");
+}
+
+/* ---------- HID report descriptors ---------- */
+
+/* G7 Pro 3537:1022-style gamepad: 16 buttons, hat, 4 u8 axes, brake/gas, no report ID (9 bytes) */
+static const uint8_t k_hid_gamepad_noid[] = {
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+    0x05, 0x02, 0x09, 0xc5, 0x09, 0xc4, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0xc0
+};
+
+/* 10A9 interface 1 style: keyboard (rid 3), consumer (rid 2), mouse (rid 9), vendor 0xFFF0 (rid 16, 63 bytes) */
+static const uint8_t k_hid_kbd_mouse_vendor[] = {
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x03,
+    0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x75, 0x08, 0x95, 0x0b, 0x15, 0x00, 0x26, 0xff, 0x00, 0x19, 0x00, 0x2a, 0xff, 0x00, 0x81, 0x00,
+    0xc0,
+    0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x02, 0x75, 0x10, 0x95, 0x02, 0x81, 0x00, 0xc0,
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x09, 0x09, 0x01, 0xa1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x75, 0x01, 0x95, 0x05, 0x81, 0x02, 0x75, 0x03, 0x95, 0x01, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
+    0x09, 0x38, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0,
+    0x06, 0xf0, 0xff, 0x09, 0x40, 0xa1, 0x01, 0x85, 0x10, 0x09, 0x00, 0x75, 0x08, 0x95, 0x3f, 0x81, 0x02,
+    0x85, 0x0f, 0x09, 0x22, 0x95, 0x3f, 0x91, 0x02, 0xc0
+};
+
+/* Gamepad behind report ID 1 (10-byte report), preceded by a push/pop and a long item */
+static const uint8_t k_hid_gamepad_rid1[] = {
+    0xa4, 0x05, 0x0c, 0xb4,                    /* push, usage page consumer, pop */
+    0xfe, 0x02, 0x10, 0xaa, 0xbb,              /* long item, 2 data bytes */
+    0x05, 0x01, 0x09, 0x04, 0xa1, 0x01, 0x85, 0x01,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x39, 0x75, 0x08, 0x95, 0x01, 0x81, 0x42,
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02,
+    0xc0,
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x02, 0x75, 0x08, 0x95, 0x20, 0x81, 0x02, 0xc0
+};
+
+static void test_hid_report_descriptors(void)
+{
+    printf("Testing HID report descriptor summaries... ");
+    usb_hid_info_t info;
+
+    assert(usb_hid_parse_report_desc(k_hid_gamepad_noid, sizeof(k_hid_gamepad_noid), &info) == 1);
+    assert(info.has_gamepad && !info.uses_report_ids);
+    assert(info.gamepad_report_id == 0 && info.gamepad_input_len == 9 && info.max_input_len == 9);
+
+    assert(usb_hid_parse_report_desc(k_hid_kbd_mouse_vendor, sizeof(k_hid_kbd_mouse_vendor), &info) == 1);
+    assert(!info.has_gamepad && info.uses_report_ids);
+    assert(info.gamepad_input_len == 0);
+    assert(info.max_input_len == 64); /* vendor rid 16: 63 bytes + ID */
+
+    assert(usb_hid_parse_report_desc(k_hid_gamepad_rid1, sizeof(k_hid_gamepad_rid1), &info) == 1);
+    assert(info.has_gamepad && info.uses_report_ids && info.gamepad_report_id == 1);
+    assert(info.gamepad_input_len == 10);
+    assert(info.max_input_len == 33);
+
+    /* Truncated items are rejected at every cut */
+    for (size_t cut = 1; cut < sizeof(k_hid_gamepad_rid1); cut++) {
+        int r = usb_hid_parse_report_desc(k_hid_gamepad_rid1, cut, &info);
+        assert(r == 0 || r == 1);
+    }
+    const uint8_t trunc_item[] = { 0x05, 0x01, 0x26, 0xff };
+    assert(usb_hid_parse_report_desc(trunc_item, sizeof(trunc_item), &info) == 0);
+    const uint8_t trunc_long[] = { 0xfe, 0x05, 0x10, 0x00 };
+    assert(usb_hid_parse_report_desc(trunc_long, sizeof(trunc_long), &info) == 0);
+    assert(usb_hid_parse_report_desc(NULL, 4, &info) == 0);
+    assert(usb_hid_parse_report_desc(k_hid_gamepad_noid, 0, &info) == 1 && !info.has_gamepad);
+
+    /* Keyboard (3), consumer (2) and mouse (9) inputs are never pad state; vendor (16) may be */
+    assert(usb_hid_parse_report_desc(k_hid_kbd_mouse_vendor, sizeof(k_hid_kbd_mouse_vendor), &info) == 1);
+    assert(info.ignore_ids[0] == ((1u << 2) | (1u << 3)) && info.ignore_ids[1] == (1u << 1));
+    for (int k = 2; k < 32; k++) assert(info.ignore_ids[k] == 0);
+    printf("OK!\n");
+}
+
+/* Keyboard (rid 1) first, then a Game Pad that declares rid 2 inside */
+static const uint8_t k_hid_kbd_then_pad[] = {
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01,
+    0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x75, 0x08, 0x95, 0x07, 0x81, 0x00, 0xc0,
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x02,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02,
+    0xc0
+};
+
+/* Consumer (rid 2) first, then a Game Pad with rid 7 (byte 22 is the pad's ID) */
+static const uint8_t k_hid_consumer_then_pad[] = {
+    0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x02, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00, 0xc0,
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x07,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x75, 0x08, 0x95, 0x08, 0x81, 0x02,
+    0xc0
+};
+
+/* Game Pad whose LED output (rid 5) is declared before its input (rid 1) */
+static const uint8_t k_hid_pad_output_first[] = {
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x05,
+    0x05, 0x08, 0x19, 0x01, 0x29, 0x04, 0x75, 0x01, 0x95, 0x04, 0x91, 0x02, 0x75, 0x04, 0x95, 0x01, 0x91, 0x03,
+    0x85, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0xc0
+};
+
+/* GameSir 8K style: Game Pad (rid 1) plus a 64/64 vendor collection (input 0x43, output 0xA2) */
+static const uint8_t k_hid_gamesir_8k[] = {
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x75, 0x08, 0x95, 0x07, 0x81, 0x02,
+    0xc0,
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x43, 0x09, 0x01, 0x75, 0x08, 0x95, 0x3f, 0x81, 0x02,
+    0x85, 0xa2, 0x09, 0x01, 0x95, 0x3f, 0x91, 0x02, 0xc0
+};
+
+static int ignored(const usb_hid_info_t *info, uint8_t id)
+{
+    return (info->ignore_ids[id >> 3] >> (id & 7)) & 1;
+}
+
+static void test_hid_report_ids_follow_gamepad_input(void)
+{
+    printf("Testing HID gamepad report ID is the one of its first input... ");
+    usb_hid_info_t info;
+
+    assert(usb_hid_parse_report_desc(k_hid_kbd_then_pad, sizeof(k_hid_kbd_then_pad), &info) == 1);
+    assert(info.has_gamepad && info.gamepad_report_id == 2 && info.gamepad_input_len == 7);
+    assert(ignored(&info, 1) && !ignored(&info, 2));
+
+    assert(usb_hid_parse_report_desc(k_hid_consumer_then_pad, sizeof(k_hid_consumer_then_pad), &info) == 1);
+    assert(info.has_gamepad && info.gamepad_report_id == 7 && info.gamepad_input_len == 11);
+    assert(ignored(&info, 2) && !ignored(&info, 7));
+
+    /* An ID that also carries pad input is never ignored */
+    uint8_t shared[sizeof(k_hid_consumer_then_pad)];
+    memcpy(shared, k_hid_consumer_then_pad, sizeof(shared));
+    assert(shared[22] == 0x07);
+    shared[22] = 0x02;
+    assert(usb_hid_parse_report_desc(shared, sizeof(shared), &info) == 1);
+    assert(info.gamepad_report_id == 2 && !ignored(&info, 2));
+
+    assert(usb_hid_parse_report_desc(k_hid_pad_output_first, sizeof(k_hid_pad_output_first), &info) == 1);
+    assert(info.has_gamepad && info.gamepad_report_id == 1 && info.gamepad_input_len == 5);
+
+    /* 8K: full reports arrive on the vendor collection, which must stay usable */
+    assert(usb_hid_parse_report_desc(k_hid_gamesir_8k, sizeof(k_hid_gamesir_8k), &info) == 1);
+    assert(info.has_gamepad && info.gamepad_report_id == 1 && info.gamepad_input_len == 10);
+    assert(info.max_input_len == 64);
+    for (int k = 0; k < 32; k++) assert(info.ignore_ids[k] == 0);
+    printf("OK!\n");
+}
+
+/* 3537:1022-like: two HID interfaces, the first a keyboard/mouse/vendor one */
+static const uint8_t two_hid_cfg[] = {
+    0x09, 0x02, 0x49, 0x00, 0x02, 0x01, 0x00, 0x80, 0xfa,
+    0x09, 0x04, 0x00, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00,
+    0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0x93, 0x00,
+    0x07, 0x05, 0x82, 0x03, 0x40, 0x00, 0x01,
+    0x07, 0x05, 0x02, 0x03, 0x40, 0x00, 0x01,
+    0x09, 0x04, 0x01, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00,
+    0x09, 0x21, 0x10, 0x01, 0x00, 0x01, 0x22, 0x4c, 0x00,
+    0x07, 0x05, 0x84, 0x03, 0x08, 0x00, 0x01,
+    0x07, 0x05, 0x04, 0x03, 0x08, 0x00, 0x01
+};
+
+typedef struct {
+    int calls;
+    int fail;            /* every fetch fails */
+    int no_pad;          /* interface 1 has no gamepad collection either */
+    uint8_t asked[4];
+} fake_fetch_t;
+
+static int fake_fetch(void *user, const usb_iface_info_t *it, uint8_t *buf, size_t cap)
+{
+    fake_fetch_t *f = (fake_fetch_t *)user;
+    if (f->calls < 4) f->asked[f->calls] = it->number;
+    f->calls++;
+    if (f->fail) return -1;
+    int pad = it->number != 0 && !f->no_pad;
+    const uint8_t *d = pad ? k_hid_gamepad_rid1 : k_hid_kbd_mouse_vendor;
+    size_t n = pad ? sizeof(k_hid_gamepad_rid1) : sizeof(k_hid_kbd_mouse_vendor);
+    assert(n <= cap);
+    memcpy(buf, d, n);
+    return (int)n;
+}
+
+static void test_hid_route_follows_gamepad_collection(void)
+{
+    printf("Testing HID routing moves to the interface with a gamepad collection... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(two_hid_cfg, sizeof(two_hid_cfg), &cfg) == 2);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_HID && route.iface == 0);
+
+    fake_fetch_t f;
+    memset(&f, 0, sizeof(f));
+    assert(usb_desc_refine_hid_route(&cfg, &route, fake_fetch, &f) == 1);
+    assert(f.calls == 2 && f.asked[0] == 0 && f.asked[1] == 1);
+    assert(route.kind == USB_ROUTE_HID && route.iface == 1);
+    assert(route.ep_in == 0x84 && route.ep_out == 0x04 && route.in_maxpkt == 8);
+    assert(route.hid_report_id == 1 && route.hid_input_len == 10 && route.hid_max_input_len == 33);
+    /* The ignore list is the chosen interface's, not the keyboard interface's */
+    for (int k = 0; k < 32; k++) assert(route.hid_ignore_ids[k] == 0);
+
+    /* No gamepad collection anywhere: the route keeps its interface but learns
+     * which report IDs are keyboard/mouse/consumer input */
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    memset(&f, 0, sizeof(f));
+    f.no_pad = 1;
+    assert(usb_desc_refine_hid_route(&cfg, &route, fake_fetch, &f) == 0);
+    assert(route.iface == 0 && route.hid_report_id == 0 && route.hid_max_input_len == 64);
+    assert(usb_route_hid_id_ignored(&route, 3) && usb_route_hid_id_ignored(&route, 2) &&
+           usb_route_hid_id_ignored(&route, 9) && !usb_route_hid_id_ignored(&route, 16) &&
+           !usb_route_hid_id_ignored(&route, 0));
+
+    /* Unreadable report descriptors leave the descriptor-based choice alone */
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    memset(&f, 0, sizeof(f));
+    f.fail = 1;
+    assert(usb_desc_refine_hid_route(&cfg, &route, fake_fetch, &f) == 0);
+    assert(route.iface == 0 && route.ep_in == 0x82 && route.hid_input_len == 0 && route.hid_report_id == 0);
+
+    /* Only HID routes are refined */
+    usb_config_info_t gip;
+    assert(usb_desc_parse_config(g7pro_gip_cfg, sizeof(g7pro_gip_cfg), &gip) == 3);
+    assert(usb_desc_select_input(&gip, &route) == 1);
+    memset(&f, 0, sizeof(f));
+    assert(usb_desc_refine_hid_route(&gip, &route, fake_fetch, &f) == 0 && f.calls == 0);
+    printf("OK!\n");
+}
+
+static void test_x360_genuine_route_uses_gamepad_out(void)
+{
+    printf("Testing genuine Xbox 360 routing uses the gamepad OUT endpoint... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(x360_genuine_cfg, sizeof(x360_genuine_cfg), &cfg) == 4);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_X360);
+    assert(route.ep_in == 0x81);
+    assert(route.ep_out == 0x01);
+    printf("OK!\n");
+}
+
+static void test_ds4_like_route(void)
+{
+    printf("Testing DS4-style audio+HID routing... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(ds4_like_cfg, sizeof(ds4_like_cfg), &cfg) == 3);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_HID);
+    assert(route.iface == 3);
+    assert(route.ep_in == 0x84);
+    assert(route.ep_out == 0x03);
+    assert(route.hid_report_len == 0x1fb);
+    printf("OK!\n");
+}
+
+static void test_keyboard_falls_back_to_legacy(void)
+{
+    printf("Testing boot keyboard is not a HID gamepad candidate... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    assert(usb_desc_parse_config(keyboard_cfg, sizeof(keyboard_cfg), &cfg) == 1);
+    assert(usb_desc_select_input(&cfg, &route) == 1);
+    assert(route.kind == USB_ROUTE_LEGACY);
+    printf("OK!\n");
+}
+
+static void test_malformed_descriptors(void)
+{
+    printf("Testing malformed/truncated descriptors... ");
+    usb_config_info_t cfg;
+    usb_input_route_t route;
+    uint8_t zero_len[] = { 0x09, 0x02, 0x40, 0x00, 0x02, 0x01, 0x00, 0xa0, 0xfa, 0x00, 0x04 };
+    assert(usb_desc_parse_config(NULL, 10, &cfg) == -1);
+    assert(usb_desc_parse_config(zero_len, 1, &cfg) == -1);
+    assert(usb_desc_parse_config(zero_len, sizeof(zero_len), &cfg) == 0);
+    assert(usb_desc_select_input(&cfg, &route) == 0);
+
+    /* Every truncation of a real descriptor must parse without reading out of bounds */
+    for (size_t n = 0; n <= sizeof(g7pro_x360_cfg); n++) {
+        uint8_t copy[sizeof(g7pro_x360_cfg)];
+        memcpy(copy, g7pro_x360_cfg, n);
+        (void)usb_desc_parse_config(copy, n, &cfg);
+        (void)usb_desc_select_input(&cfg, &route);
+    }
+    /* Truncated before the XInput endpoints: no usable IN endpoint on interface 0 */
+    assert(usb_desc_parse_config(g7pro_x360_cfg, 9 + 9 + 16, &cfg) == 1);
+    assert(usb_desc_select_input(&cfg, &route) == 0);
+    printf("OK!\n");
+}
+
+int main(void)
+{
+    printf("========================================\n");
+    printf("Running USB descriptor routing tests\n");
+    printf("========================================\n");
+    test_g7pro_gip_route();
+    test_g7pro_x360_route_skips_hid_keyboard_mouse();
+    test_x360_receiver_route_is_wireless();
+    test_hid_report_descriptors();
+    test_hid_report_ids_follow_gamepad_input();
+    test_hid_route_follows_gamepad_collection();
+    test_x360_genuine_route_uses_gamepad_out();
+    test_ds4_like_route();
+    test_keyboard_falls_back_to_legacy();
+    test_malformed_descriptors();
+    printf("\nAll USB descriptor routing tests passed!\n");
+    return 0;
+}

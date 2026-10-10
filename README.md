@@ -48,8 +48,8 @@ graph TD
         HOTPLUG["Dynamic USB Hotplug Driver<br/>(250Hz Polling / 4ms Tick)"]
         NORM["Canonical Input Normalizer<br/>(pad_packet_t & Deadzones)"]
         SLOTS["3-Slot Multi-Device Multiplexer<br/>(Virtual DualSense Pool)"]
-        WEB["Web Server & REST API<br/>(Port 8095 - Dark UI)"]
-        TCP["Local LAN Testing Socket<br/>(Port 9045 - TCP Stream)"]
+        WEB["Web Server & REST API<br/>(Port 8095 - loopback by default)"]
+        TCP["Opt-in Local Debug Socket<br/>(Port 9045 - disabled by default)"]
 
         USB --> HOTPLUG
         HOTPLUG --> NORM
@@ -84,8 +84,8 @@ graph TD
 | **Bypass Error `0x803B0006`** | Non-destructive `ptrace` code cave in `SceShellUI` respecting W^X protections. |
 | **Multi-Player (Up to 4 Players)** | 3 virtual DualSense slots (Players 2–4) + 1 official DualSense (Player 1). |
 | **Dynamic Bus Discovery** | Automatically scans `/dev/ugen*.*` nodes across PS5 Fat, Slim (CFI-2000), and Pro (CFI-7000). |
-| **Embedded Web Dashboard** | Dark UI dashboard on port 8095 for real-time slot status, battery monitoring, and manual controls. |
-| **LAN Test Port** | Inject test frames over TCP port 9045 without needing physical hardware connected. |
+| **Embedded Web Dashboard** | Dark UI dashboard on port 8095. It binds to loopback by default; authenticated LAN access can be enabled with a local token file. |
+| **Local Debug Input** | TCP input on port 9045 is compiled out by default. Development builds can opt in, and the listener binds only to loopback. |
 
 ---
 
@@ -103,6 +103,7 @@ graph TD
 |---|---|:---:|---|
 | **Machenike G5 Pro / G5 Pro Max SE** | Bundled 2.4GHz USB Dongle or USB-C Cable | 🟢 **Verified on PS5 Hardware** | Fully tested & verified in real 3-player gameplay on FW 13.60. Plug & play at 250Hz. |
 | **Microsoft Xbox Series X\|S & Xbox One** | Physical USB-C / Micro-USB Cable **OR** 8BitDo USB Adapter | 🟡 **Experimental (Spec-Implemented)** | Decodes GIP `0x20` input & `0x07` Guide packets via wired USB. *(Needs community testing on console)*. |
+| **GameSir G7 Pro** | USB-C Cable or 2.4GHz USB Dongle | 🟡 **Experimental (Spec-Implemented)** | GIP, XInput and GameSir HID modes detected from USB descriptors. *(Needs testing on console)*. |
 | **Microsoft Xbox 360** | Wired USB Cable (`045e:028e`) | 🟡 **Experimental (Spec-Implemented)** | XInput wired report parser implemented. |
 | **Sony DualShock 4** | Physical Micro-USB Cable | 🟡 **Experimental (Spec-Implemented)** | 64-byte USB HID parser implemented. *(Direct BT in v1.1.0)*. |
 | **Sony DualShock 3 (PS3)** | Physical Mini-USB Cable | 🟡 **Experimental (Spec-Implemented)** | USB magic wake packet (`0x03f4`) implemented. *(No Bluetooth)*. |
@@ -164,11 +165,10 @@ On firmwares like **13.60** (with `kstuff-1.13-fpkg-dr-test5` & `shadowmountplus
 ---
 
 ### Step 4: Live Web Dashboard (Port 8095)
-Open the control center from any smartphone, PC, or console browser on your local network:
 
-```
-http://<PS5_IP>:8095/
-```
+The default dashboard binds to loopback at `http://127.0.0.1:8095/`. To use it from another device on the LAN, enable authenticated LAN mode by installing a random token at `/data/anypad/web.token` with file mode `0600`, then restart the payload. See [docs/NETWORK_SECURITY.md](docs/NETWORK_SECURITY.md) for setup and endpoint access rules.
+
+In LAN mode, the page accepts the token in its **LAN access token** field. It keeps the token in the current browser tab's session storage. Status remains read-only and public; logs and state-changing API requests require the bearer token. The server does not grant cross-origin access.
 
 - 🎮 **Slot Status:** Real-time visibility of all 4 player slots (connected gamepads and connection types).
 - ⚡ **Power Telemetry:** Live power status (`⚡ USB Cable / 5V` for wired controllers and dongles).
@@ -182,6 +182,7 @@ http://<PS5_IP>:8095/
 - [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — Detailed controller compatibility and mappings.
 - [docs/FIRMWARE_1360_GUIDE.md](docs/FIRMWARE_1360_GUIDE.md) — FW 13.60 architecture, Relapse exploit, and code cave injection details.
 - [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) — In-depth breakdown of USB hotplug and virtual pad lifecycle.
+- [docs/NETWORK_SECURITY.md](docs/NETWORK_SECURITY.md) — Dashboard access modes, token setup, debug input, and host-test commands.
 
 ---
 
